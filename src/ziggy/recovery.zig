@@ -115,7 +115,10 @@ pub fn restoreUntil(
         names.deinit(allocator);
     }
 
-    var iter = dir.iterate();
+    var iter_dir = try dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    var iter = iter_dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, "wal-")) continue;
