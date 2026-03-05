@@ -44,6 +44,12 @@ jobs:
       - name: Soak + compatibility
         env:
           SOAK_SECONDS: ${{ github.event.inputs.soak_seconds || '21600' }}
+          PUT_P95_SLO_US: 90000
+          PUT_P99_SLO_US: 200000
+          GET_P95_SLO_US: 90000
+          GET_P99_SLO_US: 200000
+          SCAN_P95_SLO_US: 180000
+          SCAN_P99_SLO_US: 360000
         run: bash scripts/soak_compat.sh ./zig-out/bin/ziggy ./artifacts/soak "$SOAK_SECONDS"
 
       - name: Upload artifacts
