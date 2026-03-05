@@ -1901,6 +1901,8 @@ test "task 9.2 negative: stop threshold fails fast until debt drops" {
         .memtable_max_bytes = 24,
         .slowdown_l0_files = 1,
         .stop_l0_files = 1,
+        .slowdown_immutable_count = 200,
+        .stop_immutable_count = 400,
         .compaction_trigger_l0_files = 100,
     });
     defer eng.close() catch {};
