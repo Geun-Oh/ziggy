@@ -3,7 +3,12 @@ name: nightly-soak-compat
 on:
   schedule:
     - cron: '0 17 * * *' # 02:00 KST daily
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: 'Soak duration in seconds (21600 for full nightly acceptance)'
+        required: false
+        default: '21600'
 
 jobs:
   soak:
@@ -16,7 +21,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.15.2
+          version: 0.15.1
 
       - name: Build + core verification
         run: |
@@ -36,8 +41,10 @@ jobs:
       - name: ENOSPC integration (filesystem-level)
         run: bash scripts/enospc_integration.sh ./zig-out/bin/ziggy ./artifacts/enospc
 
-      - name: 6h soak + compatibility
-        run: bash scripts/soak_compat.sh ./zig-out/bin/ziggy ./artifacts/soak 21600
+      - name: Soak + compatibility
+        env:
+          SOAK_SECONDS: ${{ github.event.inputs.soak_seconds || '21600' }}
+        run: bash scripts/soak_compat.sh ./zig-out/bin/ziggy ./artifacts/soak "$SOAK_SECONDS"
 
       - name: Upload artifacts
         if: always()
