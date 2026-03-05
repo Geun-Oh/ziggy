@@ -247,7 +247,7 @@ pub const Engine = struct {
         if (config.slowdown_l0_files > config.stop_l0_files) return EngineError.InvalidConfig;
         if (config.slowdown_immutable_count > config.stop_immutable_count) return EngineError.InvalidConfig;
 
-        var dir = try std.fs.cwd().makeOpenPath(config.path, .{});
+        var dir = try std.fs.cwd().makeOpenPath(config.path, .{ .iterate = true });
         errdefer dir.close();
 
         const lock_file = try acquireLock(dir);
