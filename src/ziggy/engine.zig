@@ -1999,6 +1999,8 @@ test "task 9.3 positive: compaction limiter is wired and metrics/properties are 
         .compaction_trigger_l0_files = 2,
         .slowdown_l0_files = 200,
         .stop_l0_files = 400,
+        .slowdown_immutable_count = 200,
+        .stop_immutable_count = 400,
         .compaction_rate_bytes_per_sec = 1024,
     });
     defer eng.close() catch {};
@@ -2010,12 +2012,22 @@ test "task 9.3 positive: compaction limiter is wired and metrics/properties are 
     eng.mutex.unlock();
 
     var i: usize = 0;
-    while (i < 96) : (i += 1) {
+    var retries: usize = 0;
+    while (i < 96) {
         var kbuf: [32]u8 = undefined;
         var vbuf: [64]u8 = undefined;
         const k = try std.fmt.bufPrint(&kbuf, "rl-{d}", .{i});
         const v = try std.fmt.bufPrint(&vbuf, "payload-{d}-abcdefgh", .{i});
-        try eng.put(k, v);
+        eng.put(k, v) catch |err| switch (err) {
+            EngineError.WriteStall => {
+                retries += 1;
+                if (retries > 2000) return error.TestUnexpectedResult;
+                std.Thread.sleep(2 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        i += 1;
     }
 
     var attempts: usize = 0;
@@ -2115,7 +2127,10 @@ fn forceSstAndMutateHeader(allocator: std.mem.Allocator, dir: std.fs.Dir, db_pat
         }
     }
 
-    var it = dir.iterate();
+    var iter_dir = try dir.openDir(".", .{ .iterate = true });
+    defer iter_dir.close();
+
+    var it = iter_dir.iterate();
     var sst_name: ?[]u8 = null;
     defer if (sst_name) |name| allocator.free(name);
     while (try it.next()) |entry| {
