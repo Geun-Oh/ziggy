@@ -1,0 +1,50 @@
+name: nightly-soak-compat
+
+on:
+  schedule:
+    - cron: '0 17 * * *' # 02:00 KST daily
+  workflow_dispatch: {}
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Build + core verification
+        run: |
+          zig build
+          zig test src/ziggy/engine.zig
+          zig build test
+
+      - name: Compatibility policy gate (major/minor)
+        run: |
+          zig test src/ziggy/engine.zig --test-filter "task 10.3 positive: supported minor SST format opens successfully"
+          zig test src/ziggy/engine.zig --test-filter "task 10.3 negative: unsupported minor SST format fails fast on open"
+          zig test src/ziggy/engine.zig --test-filter "task 10.3 negative: unsupported major SST format fails fast on open"
+
+      - name: Fault matrix
+        run: bash scripts/fault_matrix.sh ./zig-out/bin/ziggy ./artifacts/fault-matrix
+
+      - name: ENOSPC integration (filesystem-level)
+        run: bash scripts/enospc_integration.sh ./zig-out/bin/ziggy ./artifacts/enospc
+
+      - name: 6h soak + compatibility
+        run: bash scripts/soak_compat.sh ./zig-out/bin/ziggy ./artifacts/soak 21600
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-soak-artifacts
+          path: |
+            artifacts/soak/result.json
+            artifacts/fault-matrix/result.json
+            artifacts/enospc/result.json
