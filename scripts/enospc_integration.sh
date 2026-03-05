@@ -185,6 +185,7 @@ import json,sys
 ) = sys.argv[1:]
 payload = {
   "ok": ok.lower() == "true",
+  "skipped": False,
   "enospc_triggered": True,
   "writes_before_failure": int(ops),
   "reopen_mode": reopen_mode,
