@@ -18,10 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.15.2
+      - name: Install Zig
+        run: bash .github/scripts/install-zig.sh 0.15.2
 
       - name: Build + core verification
         run: |

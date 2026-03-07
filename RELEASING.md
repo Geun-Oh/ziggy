@@ -89,6 +89,8 @@ git push origin v0.1.0
 
 The tag push triggers `.github/workflows/release.yml`.
 
+The workflows install Zig via `.github/scripts/install-zig.sh`, which downloads the official release archive with retry/backoff instead of relying on a third-party setup action.
+
 Expected behavior:
 
 - matrix build runs for each Tier 1 target
