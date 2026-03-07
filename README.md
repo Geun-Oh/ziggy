@@ -21,7 +21,10 @@ curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.
 
 Default install location:
 
-- `~/.local/bin/ziggy`
+- the installer automatically prefers a writable directory in this order:
+  - `/usr/local/bin`
+  - `/opt/homebrew/bin`
+  - `~/.local/bin`
 
 Override the install directory:
 
@@ -44,6 +47,26 @@ Example:
 curl -L https://github.com/Geun-Oh/ziggy/releases/latest/download/ziggy-aarch64-macos.tar.gz -o ziggy.tar.gz
 tar -xzf ziggy.tar.gz
 ./ziggy-aarch64-macos/ziggy open --path ./data
+```
+
+### Verify installation
+
+```bash
+ziggy open --path ./data
+ziggy put --path ./data --key hello --value world
+ziggy get --path ./data --key hello
+```
+
+### PATH troubleshooting
+
+If `ziggy: command not found` appears after installation, add the install directory to your shell profile.
+
+Examples:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+export PATH="/opt/homebrew/bin:$PATH"
+export PATH="/usr/local/bin:$PATH"
 ```
 
 ## What this project provides

@@ -3,7 +3,7 @@ set -eu
 
 REPO="Geun-Oh/ziggy"
 BINARY_NAME="ziggy"
-INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-}"
 VERSION="${VERSION:-latest}"
 TMP_DIR="${TMPDIR:-/tmp}/ziggy-install-$$"
 
@@ -57,6 +57,24 @@ esac
 target="${platform_arch}-${platform_os}"
 archive_name="${BINARY_NAME}-${target}.tar.gz"
 checksum_name="${archive_name}.sha256"
+
+if [ -z "$INSTALL_DIR" ]; then
+  for candidate in /usr/local/bin /opt/homebrew/bin "${HOME}/.local/bin"; do
+    parent_dir=$(dirname "$candidate")
+    if [ -d "$candidate" ] && [ -w "$candidate" ]; then
+      INSTALL_DIR="$candidate"
+      break
+    fi
+    if [ ! -d "$candidate" ] && [ -d "$parent_dir" ] && [ -w "$parent_dir" ]; then
+      INSTALL_DIR="$candidate"
+      break
+    fi
+  done
+fi
+
+if [ -z "$INSTALL_DIR" ]; then
+  INSTALL_DIR="${HOME}/.local/bin"
+fi
 
 if [ "$VERSION" = "latest" ]; then
   base_url="https://github.com/${REPO}/releases/latest/download"
