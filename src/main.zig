@@ -1,3 +1,4 @@
+//! CLI entrypoint that exposes the embedded engine through small operator-facing commands.
 const std = @import("std");
 const ziggy = @import("ziggy");
 
@@ -5,6 +6,7 @@ const CliError = error{
     InvalidArguments,
 };
 
+// Wraps the CLI runner and converts failures into human-readable or JSON errors.
 pub fn main() !void {
     run() catch |err| {
         var stderr_buffer: [2048]u8 = undefined;
@@ -32,6 +34,7 @@ pub fn main() !void {
     };
 }
 
+// Collects process arguments, prepares buffered stdout, and dispatches the command.
 fn run() !void {
     const allocator = std.heap.page_allocator;
 
@@ -46,6 +49,7 @@ fn run() !void {
     try stdout.flush();
 }
 
+// Validates arguments, opens the database, and executes one CLI command.
 fn runWithArgs(allocator: std.mem.Allocator, args: []const []const u8, stdout: anytype) !void {
     try validateArgs(args);
 
@@ -94,8 +98,16 @@ fn runWithArgs(allocator: std.mem.Allocator, args: []const []const u8, stdout: a
             try stdout.print("ok\n", .{});
         }
     } else if (std.mem.eql(u8, cmd, "scan")) {
-        const prefix = valueFor(args, "--prefix") orelse "";
-        const rows = try eng.scanPrefix(prefix);
+        const prefix = valueFor(args, "--prefix");
+        const start = valueFor(args, "--start");
+        const end = valueFor(args, "--end");
+
+        if (prefix != null and (start != null or end != null)) return CliError.InvalidArguments;
+
+        const rows = if (prefix) |p|
+            try eng.scanPrefix(p)
+        else
+            try eng.scan(.{ .start = start, .end = end });
         defer eng.freeScan(rows);
 
         if (json) {
@@ -153,11 +165,13 @@ fn runWithArgs(allocator: std.mem.Allocator, args: []const []const u8, stdout: a
     }
 }
 
+// Returns true when a flag token appears anywhere in the argument list.
 fn hasFlag(args: []const []const u8, flag: []const u8) bool {
     for (args) |a| if (std.mem.eql(u8, a, flag)) return true;
     return false;
 }
 
+// Returns the value paired with a named option like --path or --key.
 fn valueFor(args: []const []const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i + 1 < args.len) : (i += 1) {
@@ -166,6 +180,7 @@ fn valueFor(args: []const []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+// Enforces command shape, required options, and scan bound invariants before execution.
 fn validateArgs(args: []const []const u8) !void {
     if (args.len < 2) return CliError.InvalidArguments;
 
@@ -197,9 +212,21 @@ fn validateArgs(args: []const []const u8) !void {
         _ = valueFor(args, "--key") orelse return CliError.InvalidArguments;
     } else if (std.mem.eql(u8, cmd, "property")) {
         _ = valueFor(args, "--name") orelse return CliError.InvalidArguments;
+    } else if (std.mem.eql(u8, cmd, "scan")) {
+        const prefix = valueFor(args, "--prefix");
+        const start = valueFor(args, "--start");
+        const end = valueFor(args, "--end");
+        if (prefix != null and (start != null or end != null)) return CliError.InvalidArguments;
+        if (end != null and start == null) return CliError.InvalidArguments;
+        if (start) |s| {
+            if (end) |e| {
+                if (std.mem.order(u8, s, e) == .gt) return CliError.InvalidArguments;
+            }
+        }
     }
 }
 
+// Returns whether the token names a supported top-level command.
 fn isCommand(cmd: []const u8) bool {
     return std.mem.eql(u8, cmd, "open") or
         std.mem.eql(u8, cmd, "put") or
@@ -211,11 +238,14 @@ fn isCommand(cmd: []const u8) bool {
         std.mem.eql(u8, cmd, "property");
 }
 
+// Returns whether the option expects a following value token.
 fn isValueFlag(flag: []const u8) bool {
     return std.mem.eql(u8, flag, "--path") or
         std.mem.eql(u8, flag, "--key") or
         std.mem.eql(u8, flag, "--value") or
         std.mem.eql(u8, flag, "--prefix") or
+        std.mem.eql(u8, flag, "--start") or
+        std.mem.eql(u8, flag, "--end") or
         std.mem.eql(u8, flag, "--name");
 }
 
@@ -226,6 +256,7 @@ fn processHasFlag(flag: []const u8) bool {
     return hasFlag(args, flag);
 }
 
+// Maps internal errors onto stable user-facing CLI messages.
 fn errorMessage(err: anyerror) []const u8 {
     return switch (err) {
         CliError.InvalidArguments => "invalid arguments",
@@ -239,6 +270,7 @@ fn errorMessage(err: anyerror) []const u8 {
     };
 }
 
+// Emits a JSON-safe string literal without depending on a full serializer.
 fn writeJsonString(w: anytype, value: []const u8) !void {
     try w.writeByte('"');
     for (value) |c| {
@@ -260,6 +292,7 @@ fn writeJsonString(w: anytype, value: []const u8) !void {
     try w.writeByte('"');
 }
 
+// Prints the supported CLI commands and their required flags.
 fn printUsage(w: *std.Io.Writer) !void {
     try w.print(
         "usage:\n" ++
@@ -267,7 +300,7 @@ fn printUsage(w: *std.Io.Writer) !void {
             "  ziggy put --path <db_dir> --key <k> --value <v> [--json]\n" ++
             "  ziggy get --path <db_dir> --key <k> [--json]\n" ++
             "  ziggy delete --path <db_dir> --key <k> [--json]\n" ++
-            "  ziggy scan --path <db_dir> [--prefix <p>] [--json]\n" ++
+            "  ziggy scan --path <db_dir> [--prefix <p> | --start <k> [--end <k>]] [--json]\n" ++
             "  ziggy stats --path <db_dir> [--json]\n" ++
             "  ziggy property --path <db_dir> --name <prop> [--json]\n" ++
             "  ziggy doctor --path <db_dir> [--json]\n",
@@ -279,11 +312,16 @@ test "task 7.3 negative: malformed flags and missing values are rejected" {
     try std.testing.expectError(CliError.InvalidArguments, validateArgs(&.{ "ziggy", "put", "--path", "/tmp/db", "--key", "k", "--oops" }));
     try std.testing.expectError(CliError.InvalidArguments, validateArgs(&.{ "ziggy", "put", "--path", "/tmp/db", "--key" }));
     try std.testing.expectError(CliError.InvalidArguments, validateArgs(&.{ "ziggy", "get", "--path" }));
+    try std.testing.expectError(CliError.InvalidArguments, validateArgs(&.{ "ziggy", "scan", "--path", "/tmp/db", "--prefix", "a", "--start", "b" }));
+    try std.testing.expectError(CliError.InvalidArguments, validateArgs(&.{ "ziggy", "scan", "--path", "/tmp/db", "--start", "z", "--end", "a" }));
+    try std.testing.expectError(CliError.InvalidArguments, validateArgs(&.{ "ziggy", "scan", "--path", "/tmp/db", "--end", "user:200" }));
 }
 
 test "task 7.3 positive: valid command shape passes argument validation" {
     try validateArgs(&.{ "ziggy", "put", "--path", "/tmp/db", "--key", "a", "--value", "b", "--json" });
     try validateArgs(&.{ "ziggy", "scan", "--path", "/tmp/db", "--prefix", "user:" });
+    try validateArgs(&.{ "ziggy", "scan", "--path", "/tmp/db", "--start", "user:100" });
+    try validateArgs(&.{ "ziggy", "scan", "--path", "/tmp/db", "--start", "user:100", "--end", "user:200" });
 }
 
 test "task 7.3 negative: invalid path surfaces explicit filesystem error" {
@@ -306,6 +344,145 @@ test "task 7.3 negative: invalid path surfaces explicit filesystem error" {
     var writer = out.writer(allocator);
 
     try std.testing.expectError(error.NotDir, runWithArgs(allocator, &.{ "ziggy", "open", "--path", bad_path }, &writer));
+}
+
+test "task 12.3 positive: scan command supports --start-only" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try ziggy.engine.Engine.open(allocator, .{ .path = db_path });
+        defer eng.close() catch {};
+        try eng.put("a", "1");
+        try eng.put("b", "2");
+        try eng.put("c", "3");
+    }
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    var writer = out.writer(allocator);
+
+    const args = [_][]const u8{
+        "ziggy",
+        "scan",
+        "--path",
+        db_path,
+        "--start",
+        "b",
+        "--json",
+    };
+
+    try runWithArgs(allocator, &args, &writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"key\":\"a\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"key\":\"b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"key\":\"c\"") != null);
+}
+
+test "task 12.3 positive: scan command supports --start plus --end" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try ziggy.engine.Engine.open(allocator, .{ .path = db_path });
+        defer eng.close() catch {};
+        try eng.put("a", "1");
+        try eng.put("b", "2");
+        try eng.put("c", "3");
+    }
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    var writer = out.writer(allocator);
+
+    const args = [_][]const u8{
+        "ziggy",
+        "scan",
+        "--path",
+        db_path,
+        "--start",
+        "b",
+        "--end",
+        "d",
+        "--json",
+    };
+
+    try runWithArgs(allocator, &args, &writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"key\":\"b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"key\":\"c\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"key\":\"a\"") == null);
+}
+
+test "task 12.3 negative: scan command rejects --end without --start" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    var writer = out.writer(allocator);
+
+    try std.testing.expectError(
+        CliError.InvalidArguments,
+        runWithArgs(allocator, &.{ "ziggy", "scan", "--path", db_path, "--end", "d", "--json" }, &writer),
+    );
+}
+
+test "task 8.2 integration: CLI get/scan/prefix align with engine read visibility" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try ziggy.engine.Engine.open(allocator, .{ .path = db_path, .memtable_max_bytes = 16, .compaction_trigger_l0_files = 100 });
+        defer eng.close() catch {};
+
+        try eng.put("user:001", "v1");
+        try eng.put("user:002", "v2");
+        try eng.put("user:003", "v3");
+        try eng.delete("user:002");
+        try eng.put("user:001", "v1-new");
+    }
+
+    var get_out = std.ArrayList(u8).empty;
+    defer get_out.deinit(allocator);
+    var get_writer = get_out.writer(allocator);
+    try runWithArgs(allocator, &.{ "ziggy", "get", "--path", db_path, "--key", "user:001", "--json" }, &get_writer);
+
+    var scan_out = std.ArrayList(u8).empty;
+    defer scan_out.deinit(allocator);
+    var scan_writer = scan_out.writer(allocator);
+    try runWithArgs(allocator, &.{ "ziggy", "scan", "--path", db_path, "--start", "user:", "--end", "user;", "--json" }, &scan_writer);
+
+    var prefix_out = std.ArrayList(u8).empty;
+    defer prefix_out.deinit(allocator);
+    var prefix_writer = prefix_out.writer(allocator);
+    try runWithArgs(allocator, &.{ "ziggy", "scan", "--path", db_path, "--prefix", "user:", "--json" }, &prefix_writer);
+
+    try std.testing.expect(std.mem.indexOf(u8, get_out.items, "\"value\":\"v1-new\"") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, scan_out.items, "\"key\":\"user:001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scan_out.items, "\"value\":\"v1-new\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scan_out.items, "\"key\":\"user:003\"") != null);
+
+    try std.testing.expect(std.mem.eql(u8, scan_out.items, prefix_out.items));
 }
 
 test "task 7.3 regression: json escaping covers quotes control chars and slashes" {
