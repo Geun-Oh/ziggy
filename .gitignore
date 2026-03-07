@@ -8,3 +8,14 @@ artifacts/
 
 # macOS/editor noise
 .DS_Store
+
+# Local agent/operator notes
+.omx
+.pi-*
+ENGINE_GET_AUDIT.md
+_write_ahead_log.md
+
+# Other
+.omx
+.pi-*
+_write_ahead_log.md
