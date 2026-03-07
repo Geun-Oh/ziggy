@@ -1,0 +1,10 @@
+# Zig build outputs
+.zig-cache/
+zig-out/
+
+# Local runtime/test artifacts
+artifacts/
+.tmp-cli/
+
+# macOS/editor noise
+.DS_Store
