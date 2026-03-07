@@ -5,6 +5,7 @@ zig-out/
 # Local runtime/test artifacts
 artifacts/
 .tmp-cli/
+data/
 
 # macOS/editor noise
 .DS_Store
