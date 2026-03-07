@@ -1,3 +1,4 @@
+//! Small experiment that queries the IPv4 address of a named network interface via ioctl.
 const std = @import("std");
 const libc = @cImport({
     @cInclude("sys/ioctl.h");
@@ -5,6 +6,7 @@ const libc = @cImport({
     @cInclude("netinet/in.h");
 });
 
+// Opens a socket, fills ifreq, and prints the address assigned to en0.
 pub fn main() !void {
     var ifr: libc.ifreq = undefined;
     const interface_name = "en0";

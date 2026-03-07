@@ -1,11 +1,14 @@
+//! Prefix-compressed block encoding with restart points for point lookups and random access.
 const std = @import("std");
 
+// Errors raised while encoding or decoding compressed blocks.
 pub const PrefixBlockError = error{
     InvalidInput,
     DecompressionFailure,
     OutOfMemory,
 };
 
+// Returns the shared byte prefix length for two sorted keys.
 fn commonPrefixLen(a: []const u8, b: []const u8) usize {
     const n = @min(a.len, b.len);
     var i: usize = 0;
@@ -13,6 +16,7 @@ fn commonPrefixLen(a: []const u8, b: []const u8) usize {
     return i;
 }
 
+// Encodes an integer using base-128 varint continuation bytes.
 fn appendVarint(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: usize) !void {
     var x = value;
     while (x >= 0x80) {
@@ -22,6 +26,7 @@ fn appendVarint(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: us
     try out.append(allocator, @as(u8, @intCast(x)));
 }
 
+// Decodes one varint and advances the shared cursor.
 fn decodeVarint(bytes: []const u8, cursor: *usize) PrefixBlockError!usize {
     var shift: usize = 0;
     var out: usize = 0;
@@ -41,6 +46,7 @@ fn decodeVarint(bytes: []const u8, cursor: *usize) PrefixBlockError!usize {
     return out;
 }
 
+// Reads a little-endian u32 while checking bounds.
 fn readU32Le(bytes: []const u8, pos: usize) PrefixBlockError!u32 {
     if (pos + 4 > bytes.len) return PrefixBlockError.DecompressionFailure;
     return @as(u32, bytes[pos]) |
@@ -49,6 +55,7 @@ fn readU32Le(bytes: []const u8, pos: usize) PrefixBlockError!u32 {
         (@as(u32, bytes[pos + 3]) << 24);
 }
 
+// Appends a little-endian u32 to the output buffer.
 fn appendU32Le(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) !void {
     try out.append(allocator, @intCast(value & 0xFF));
     try out.append(allocator, @intCast((value >> 8) & 0xFF));
@@ -56,6 +63,7 @@ fn appendU32Le(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32
     try out.append(allocator, @intCast((value >> 24) & 0xFF));
 }
 
+// Encodes sorted keys and values using shared prefixes plus a restart table footer.
 pub fn encode(
     allocator: std.mem.Allocator,
     keys: []const []const u8,
@@ -99,6 +107,7 @@ pub fn encode(
     return out.toOwnedSlice(allocator);
 }
 
+// Decodes one prefix-compressed entry using the previous reconstructed key.
 fn decodeEntry(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -129,6 +138,7 @@ fn decodeEntry(
     return .{ .key = key, .value = value };
 }
 
+// Locates the restart table footer at the tail of the block.
 fn restartTableStart(bytes: []const u8) PrefixBlockError!usize {
     if (bytes.len < 4) return PrefixBlockError.DecompressionFailure;
     const restart_count = try readU32Le(bytes, bytes.len - 4);
@@ -137,6 +147,7 @@ fn restartTableStart(bytes: []const u8) PrefixBlockError!usize {
     return bytes.len - 4 - table_bytes;
 }
 
+// Reconstructs the key at a logical entry index.
 pub fn decodeKeyAt(allocator: std.mem.Allocator, bytes: []const u8, target_index: usize) PrefixBlockError![]u8 {
     const limit = try restartTableStart(bytes);
     var cursor: usize = 0;
@@ -161,6 +172,7 @@ pub fn decodeKeyAt(allocator: std.mem.Allocator, bytes: []const u8, target_index
     return PrefixBlockError.DecompressionFailure;
 }
 
+// Sequentially scans the block until it finds the requested key and returns its value copy.
 pub fn getValue(allocator: std.mem.Allocator, bytes: []const u8, target_key: []const u8) PrefixBlockError!?[]u8 {
     const limit = try restartTableStart(bytes);
     var cursor: usize = 0;

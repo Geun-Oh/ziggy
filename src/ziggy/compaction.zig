@@ -1,3 +1,4 @@
+//! Standalone compaction manager used to merge SSTables and test background compaction behavior.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -11,12 +12,14 @@ pub const WorkerError = error{
     WorkerAlreadyRunning,
 };
 
+// One versioned SSTable entry used by the compaction simulator.
 pub const Entry = struct {
     key: []u8,
     value: []u8,
     sequence: u64,
     tombstone: bool,
 
+    // Deep-copies an entry so compaction outputs own their memory.
     pub fn clone(self: Entry, allocator: std.mem.Allocator) !Entry {
         return .{
             .key = try allocator.dupe(u8, self.key),
@@ -26,12 +29,14 @@ pub const Entry = struct {
         };
     }
 
+    // Releases key and value buffers held by the entry.
     pub fn deinit(self: Entry, allocator: std.mem.Allocator) void {
         allocator.free(self.key);
         allocator.free(self.value);
     }
 };
 
+// In-memory SSTable model with key-range metadata and ordered entries.
 pub const SSTable = struct {
     id: u64,
     level: u8,
@@ -39,6 +44,7 @@ pub const SSTable = struct {
     max_key: []u8,
     entries: std.ArrayList(Entry),
 
+    // Creates an empty table shell with owned key-range metadata.
     pub fn init(allocator: std.mem.Allocator, id: u64, level: u8, min_key: []const u8, max_key: []const u8) !SSTable {
         return .{
             .id = id,
@@ -49,6 +55,7 @@ pub const SSTable = struct {
         };
     }
 
+    // Frees the range metadata and all owned entries.
     pub fn deinit(self: *SSTable, allocator: std.mem.Allocator) void {
         allocator.free(self.min_key);
         allocator.free(self.max_key);
@@ -56,6 +63,7 @@ pub const SSTable = struct {
         self.entries.deinit(allocator);
     }
 
+    // Returns a rough size estimate used for level pressure decisions.
     pub fn estimatedBytes(self: *const SSTable) usize {
         var total: usize = 0;
         for (self.entries.items) |e| total += e.key.len + e.value.len + 16;
@@ -65,6 +73,7 @@ pub const SSTable = struct {
 
 pub const MAX_LEVELS = 7;
 
+// Owns per-level SSTable sets and optional background compaction workers.
 pub const CompactionManager = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
@@ -91,10 +100,12 @@ pub const CompactionManager = struct {
     worker_notify_count: std.atomic.Value(usize),
     worker_wake_count: std.atomic.Value(usize),
 
+    // Creates an in-memory manager with no on-disk persistence.
     pub fn init(allocator: std.mem.Allocator, base_level_bytes: usize) CompactionManager {
         return initOptions(allocator, base_level_bytes, null, false);
     }
 
+    // Creates a manager that mirrors SSTables and manifest records into a storage directory.
     pub fn initWithStorage(allocator: std.mem.Allocator, base_level_bytes: usize, storage_dir: std.fs.Dir) CompactionManager {
         return initOptions(allocator, base_level_bytes, storage_dir, false);
     }
@@ -103,6 +114,7 @@ pub const CompactionManager = struct {
         return initOptions(allocator, base_level_bytes, storage_dir, true);
     }
 
+    // Shared constructor that sets up worker state and optional on-disk mirroring.
     fn initOptions(
         allocator: std.mem.Allocator,
         base_level_bytes: usize,
@@ -138,6 +150,7 @@ pub const CompactionManager = struct {
         };
     }
 
+    // Stops background work and releases every table in every level.
     pub fn deinit(self: *CompactionManager) void {
         self.stopBackground();
 
@@ -147,10 +160,12 @@ pub const CompactionManager = struct {
         }
     }
 
+    // Allows tests to opt into env-driven fault injection.
     pub fn setEnvFailureInjectionEnabledForTests(self: *CompactionManager, enabled: bool) void {
         if (builtin.is_test) self.allow_env_failure_injection = enabled;
     }
 
+    // Inserts a table into a level and wakes the worker if compaction might now be needed.
     pub fn addTable(self: *CompactionManager, level: usize, table: SSTable) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -215,6 +230,7 @@ pub const CompactionManager = struct {
         return self.last_error_os;
     }
 
+    // Starts a background thread that periodically or reactively compacts eligible levels.
     pub fn startBackground(self: *CompactionManager, interval_ms: u64) WorkerError!void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -229,6 +245,7 @@ pub const CompactionManager = struct {
         self.worker_thread = std.Thread.spawn(.{}, workerMain, .{self}) catch return WorkerError.WorkerAlreadyRunning;
     }
 
+    // Stops and joins the background worker if it is running.
     pub fn stopBackground(self: *CompactionManager) void {
         self.worker_stop.store(true, .release);
         self.notifyWorker();
@@ -241,6 +258,7 @@ pub const CompactionManager = struct {
         if (maybe_thread) |t| t.join();
     }
 
+    // Sets the pending flag and wakes the background compaction worker.
     fn notifyWorker(self: *CompactionManager) void {
         self.worker_wait_mutex.lock();
         self.worker_pending = true;
@@ -249,6 +267,7 @@ pub const CompactionManager = struct {
         self.worker_wait_mutex.unlock();
     }
 
+    // Repeatedly attempts compaction and then waits for a signal or timeout.
     fn workerMain(self: *CompactionManager) void {
         self.worker_running.store(true, .release);
         defer self.worker_running.store(false, .release);
@@ -277,6 +296,7 @@ pub const CompactionManager = struct {
         }
     }
 
+    // Records the last compaction failure for tests and diagnostics.
     fn logCompactionFailure(self: *CompactionManager, err: CompactionError, os_err: anyerror) void {
         std.log.warn("compaction failed: {s} (os: {s})", .{ @errorName(err), @errorName(os_err) });
         self.last_error = err;
@@ -284,6 +304,7 @@ pub const CompactionManager = struct {
         self.error_log_count += 1;
     }
 
+    // Computes the target size budget for one level.
     fn levelTarget(self: *const CompactionManager, level: usize) usize {
         var out = self.base_level_bytes;
         var i: usize = 0;
@@ -291,16 +312,19 @@ pub const CompactionManager = struct {
         return out;
     }
 
+    // Sums the estimated byte sizes of all tables currently in a level.
     fn levelBytes(self: *const CompactionManager, level: usize) usize {
         var total: usize = 0;
         for (self.levels[level].items) |*table| total += table.estimatedBytes();
         return total;
     }
 
+    // Returns whether two key ranges intersect.
     fn overlaps(a: *const SSTable, b: *const SSTable) bool {
         return !(std.mem.order(u8, a.max_key, b.min_key) == .lt or std.mem.order(u8, b.max_key, a.min_key) == .lt);
     }
 
+    // Checks whether a key still exists below the compaction output level before dropping tombstones.
     fn keyExistsDeeper(self: *CompactionManager, start_level: usize, key: []const u8) bool {
         var level = start_level;
         while (level < MAX_LEVELS) : (level += 1) {
@@ -313,14 +337,17 @@ pub const CompactionManager = struct {
         return false;
     }
 
+    // Enables env-based faults only for test builds that explicitly opt in.
     fn shouldHonorEnvFailureInjection(self: *const CompactionManager) bool {
         return builtin.is_test and self.allow_env_failure_injection;
     }
 
+    // Formats the mirrored on-disk file name for a table id and extension.
     fn tableFileName(table_id: u64, ext: []const u8, out: []u8) ![]const u8 {
         return std.fmt.bufPrint(out, "sst-{d}.{s}", .{ table_id, ext });
     }
 
+    // Mirrors one in-memory table to disk using the simple test-friendly text format.
     fn writeTableToFile(self: *CompactionManager, table: *const SSTable, ext: []const u8) !void {
         const dir = self.storage_dir orelse return;
 
@@ -342,6 +369,7 @@ pub const CompactionManager = struct {
         try f.sync();
     }
 
+    // Best-effort removal of one mirrored table file variant.
     fn deleteTableFileExt(self: *CompactionManager, table_id: u64, ext: []const u8) void {
         const dir = self.storage_dir orelse return;
         var name_buf: [64]u8 = undefined;
@@ -349,10 +377,12 @@ pub const CompactionManager = struct {
         dir.deleteFile(file_name) catch {};
     }
 
+    // Deletes the finalized .sst file for a table.
     fn deleteTableFile(self: *CompactionManager, table_id: u64) void {
         self.deleteTableFileExt(table_id, "sst");
     }
 
+    // Renames a temporary compaction output into its finalized SST file name.
     fn finalizeTempTableFile(self: *CompactionManager, table_id: u64) !void {
         const dir = self.storage_dir orelse return;
 
@@ -363,6 +393,7 @@ pub const CompactionManager = struct {
         try dir.rename(tmp_name, sst_name);
     }
 
+    // Appends a human-readable compaction record to the mirrored MANIFEST file.
     fn appendManifestRecord(self: *CompactionManager, level: usize, new_id: u64, old_ids: []const u64) !void {
         const dir = self.storage_dir orelse return;
 
@@ -384,6 +415,7 @@ pub const CompactionManager = struct {
         try manifest.sync();
     }
 
+    // Finds the first oversized level and tries a single compaction pass.
     pub fn compactOnePass(self: *CompactionManager) CompactionError!bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -397,12 +429,14 @@ pub const CompactionManager = struct {
         return false;
     }
 
+    // Tries to compact one explicit level while holding the manager mutex.
     pub fn maybeCompact(self: *CompactionManager, level: usize) CompactionError!bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.maybeCompactLocked(level);
     }
 
+    // Merges one source table with overlapping next-level tables and atomically swaps them in memory.
     fn maybeCompactLocked(self: *CompactionManager, level: usize) CompactionError!bool {
         if (level + 1 >= MAX_LEVELS) return false;
         if (self.levelBytes(level) <= self.levelTarget(level)) return false;

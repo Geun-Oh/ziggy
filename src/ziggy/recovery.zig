@@ -1,8 +1,10 @@
+//! Point-in-time recovery helpers for archived WAL segments.
 const std = @import("std");
 const wal = @import("wal.zig");
 
 pub const RecoveryError = anyerror;
 
+// Logical mutation record archived for PITR replay.
 pub const Mutation = struct {
     timestamp_micros: i64,
     tombstone: bool,
@@ -10,6 +12,7 @@ pub const Mutation = struct {
     value: []const u8,
 };
 
+// Serializes one logical mutation into a compact WAL-friendly payload.
 pub fn encodeMutation(allocator: std.mem.Allocator, m: Mutation) ![]u8 {
     if (m.key.len > std.math.maxInt(u16) or m.value.len > std.math.maxInt(u16)) {
         return RecoveryError.InvalidRecord;
@@ -28,12 +31,14 @@ pub fn encodeMutation(allocator: std.mem.Allocator, m: Mutation) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+// Extracts the sortable numeric suffix from an archived wal-<seq> file name.
 fn parseWalSequence(name: []const u8) ?u64 {
     if (!std.mem.startsWith(u8, name, "wal-")) return null;
     const suffix = name[4..];
     return std.fmt.parseUnsigned(u64, suffix, 10) catch null;
 }
 
+// Parses a serialized mutation payload back into field slices over the input buffer.
 pub fn decodeMutation(bytes: []const u8) RecoveryError!Mutation {
     if (bytes.len < 13) return RecoveryError.InvalidRecord;
 
@@ -63,13 +68,16 @@ pub fn decodeMutation(bytes: []const u8) RecoveryError!Mutation {
     };
 }
 
+// Persists archived WAL segments used during restore.
 pub const ArchiveManager = struct {
     dir: std.fs.Dir,
 
+    // Binds the archive manager to a directory containing archived WAL segments.
     pub fn init(dir: std.fs.Dir) ArchiveManager {
         return .{ .dir = dir };
     }
 
+    // Writes and fsyncs one archived WAL segment.
     pub fn archiveSegment(self: *ArchiveManager, name: []const u8, bytes: []const u8) !void {
         var f = try self.dir.createFile(name, .{ .truncate = true });
         defer f.close();
@@ -80,6 +88,7 @@ pub const ArchiveManager = struct {
 
 pub const KV = std.StringHashMap([]u8);
 
+// Deep-copies the caller-provided base state before replay begins.
 fn cloneBaseState(allocator: std.mem.Allocator, base: *const KV) !KV {
     var out = KV.init(allocator);
     errdefer out.deinit();
@@ -91,6 +100,7 @@ fn cloneBaseState(allocator: std.mem.Allocator, base: *const KV) !KV {
     return out;
 }
 
+// Frees a restored key/value snapshot map.
 pub fn deinitState(allocator: std.mem.Allocator, state: *KV) void {
     var it = state.iterator();
     while (it.next()) |entry| {
@@ -100,6 +110,7 @@ pub fn deinitState(allocator: std.mem.Allocator, state: *KV) void {
     state.deinit();
 }
 
+// Replays archived WAL files in order until the target timestamp is reached.
 pub fn restoreUntil(
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,

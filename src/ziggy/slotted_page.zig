@@ -1,11 +1,14 @@
+//! Slotted-page builder used for fixed-size block packing and binary-searchable tuples.
 const std = @import("std");
 
+// Structural and capacity errors for slotted blocks.
 pub const SlottedPageError = error{
     BlockFull,
     CorruptedBlock,
     InvalidLayout,
 };
 
+// Builds a block where tuple payloads grow forward and slot offsets grow backward.
 pub const SlottedPageBuilder = struct {
     allocator: std.mem.Allocator,
     block: []u8,
@@ -14,6 +17,7 @@ pub const SlottedPageBuilder = struct {
     data_end: u16,
     slot_count: u16,
 
+    // Allocates a zeroed block and validates the header/footer layout bounds.
     pub fn init(allocator: std.mem.Allocator, block_size: usize, header_size: usize) !SlottedPageBuilder {
         if (block_size > std.math.maxInt(u16)) return SlottedPageError.InvalidLayout;
         if (header_size > std.math.maxInt(u16)) return SlottedPageError.InvalidLayout;
@@ -32,23 +36,28 @@ pub const SlottedPageBuilder = struct {
         };
     }
 
+    // Releases the owned block buffer.
     pub fn deinit(self: *SlottedPageBuilder) void {
         self.allocator.free(self.block);
     }
 
+    // Returns the footer position where a slot offset is stored.
     fn slotPos(self: *const SlottedPageBuilder, idx: usize) usize {
         return self.block_size - ((idx + 1) * @sizeOf(u16));
     }
 
+    // Writes a little-endian u16 into the block.
     fn writeU16(self: *SlottedPageBuilder, pos: usize, v: u16) void {
         self.block[pos] = @intCast(v & 0xFF);
         self.block[pos + 1] = @intCast((v >> 8) & 0xFF);
     }
 
+    // Reads a little-endian u16 from the block.
     fn readU16(self: *const SlottedPageBuilder, pos: usize) u16 {
         return @as(u16, self.block[pos]) | (@as(u16, self.block[pos + 1]) << 8);
     }
 
+    // Appends one key/value tuple and stores its offset in the slot footer.
     pub fn append(self: *SlottedPageBuilder, key: []const u8, value: []const u8) SlottedPageError!void {
         if (key.len > std.math.maxInt(u16) or value.len > std.math.maxInt(u16)) {
             return SlottedPageError.BlockFull;
@@ -75,11 +84,13 @@ pub const SlottedPageBuilder = struct {
         self.slot_count += 1;
     }
 
+    // Returns the physical tuple offset for a logical slot index.
     pub fn getSlotOffset(self: *const SlottedPageBuilder, logical_index: usize) SlottedPageError!u16 {
         if (logical_index >= self.slot_count) return SlottedPageError.CorruptedBlock;
         return self.readU16(self.slotPos(logical_index));
     }
 
+    // Reads the key slice for one stored tuple.
     pub fn keyAt(self: *const SlottedPageBuilder, logical_index: usize) SlottedPageError![]const u8 {
         const off = try self.getSlotOffset(logical_index);
         const off_usize: usize = off;
@@ -93,6 +104,7 @@ pub const SlottedPageBuilder = struct {
         return self.block[start..key_end];
     }
 
+    // Reads the value slice for one stored tuple.
     pub fn valueAt(self: *const SlottedPageBuilder, logical_index: usize) SlottedPageError![]const u8 {
         const off = try self.getSlotOffset(logical_index);
         const off_usize: usize = off;
@@ -105,6 +117,7 @@ pub const SlottedPageBuilder = struct {
         return self.block[start..end];
     }
 
+    // Searches the sorted slots without materializing a separate index.
     pub fn binarySearch(self: *const SlottedPageBuilder, key: []const u8) SlottedPageError!?usize {
         var lo: usize = 0;
         var hi: usize = self.slot_count;
@@ -121,6 +134,7 @@ pub const SlottedPageBuilder = struct {
         return null;
     }
 
+    // Reports how many bytes remain between tuple data and the slot footer.
     pub fn freeGap(self: *const SlottedPageBuilder) usize {
         const slot_start = self.block_size - @as(usize, self.slot_count) * @sizeOf(u16);
         return slot_start - self.data_end;

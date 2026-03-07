@@ -1,5 +1,7 @@
+//! Lock-free skip-list memtable used as the in-memory write buffer.
 const std = @import("std");
 
+// Insert-time validation and allocation failures for the memtable.
 pub const MemTableError = error{
     KeyTooLarge,
     OutOfMemory,
@@ -13,6 +15,7 @@ const Node = struct {
     height: u8,
     next: [MAX_LEVELS]std.atomic.Value(?*Node),
 
+    // Initializes one skip-list node with all next pointers cleared.
     fn init(key: []u8, value: []u8, height: u8) Node {
         var node = Node{
             .key = key,
@@ -25,12 +28,14 @@ const Node = struct {
     }
 };
 
+// Concurrent skip list storing sorted key/value pairs.
 pub const MemTable = struct {
     allocator: std.mem.Allocator,
     max_key_size: usize,
     head: *Node,
     node_count: std.atomic.Value(usize),
 
+    // Creates the head tower and records the maximum accepted key length.
     pub fn init(allocator: std.mem.Allocator, max_key_size: usize) !MemTable {
         const head = try allocator.create(Node);
         head.* = Node.init(try allocator.dupe(u8, ""), try allocator.dupe(u8, ""), MAX_LEVELS);
@@ -57,6 +62,7 @@ pub const MemTable = struct {
         self.allocator.destroy(self.head);
     }
 
+    // Deterministically derives a tower height from the key hash.
     fn pickHeight(key: []const u8) u8 {
         var h: u8 = 1;
         var bits = std.hash.Wyhash.hash(0, key);
@@ -67,10 +73,12 @@ pub const MemTable = struct {
         return h;
     }
 
+    // Centralized bytewise key ordering helper.
     fn keyOrder(a: []const u8, b: []const u8) std.math.Order {
         return std.mem.order(u8, a, b);
     }
 
+    // Finds predecessor and successor nodes at each level for a prospective insert.
     fn findSplice(self: *MemTable, key: []const u8, preds: *[MAX_LEVELS]*Node, succs: *[MAX_LEVELS]?*Node) bool {
         var pred = self.head;
         var found = false;
@@ -101,6 +109,7 @@ pub const MemTable = struct {
         return found;
     }
 
+    // Allocates an owned node copy for insertion.
     fn allocateNode(self: *MemTable, key: []const u8, value: []const u8, height: u8) MemTableError!*Node {
         const key_copy = self.allocator.dupe(u8, key) catch return MemTableError.OutOfMemory;
         errdefer self.allocator.free(key_copy);
@@ -113,6 +122,7 @@ pub const MemTable = struct {
         return node;
     }
 
+    // Inserts a key once and links a new node into the skip list from the bottom up.
     pub fn insert(self: *MemTable, key: []const u8, value: []const u8) MemTableError!void {
         if (key.len > self.max_key_size) return MemTableError.KeyTooLarge;
 
@@ -153,6 +163,7 @@ pub const MemTable = struct {
         }
     }
 
+    // Traverses the skip list to find an exact key match.
     pub fn get(self: *MemTable, key: []const u8) ?[]const u8 {
         var pred = self.head;
 
@@ -176,10 +187,12 @@ pub const MemTable = struct {
         return null;
     }
 
+    // Returns the number of inserted nodes currently visible from level 0.
     pub fn count(self: *MemTable) usize {
         return self.node_count.load(.acquire);
     }
 
+    // Materializes all keys in sorted order for tests and diagnostics.
     pub fn collectKeys(self: *MemTable, allocator: std.mem.Allocator) ![][]u8 {
         var out = std.ArrayList([]u8).empty;
         errdefer {

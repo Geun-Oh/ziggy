@@ -1,20 +1,24 @@
+//! Minimal MVCC model used to reason about sequence visibility and tombstones.
 const std = @import("std");
 
 pub const MvccError = error{
     KeyNotFound,
 };
 
+// One committed version of a key.
 pub const Version = struct {
     sequence: u64,
     tombstone: bool,
     value: []u8,
 };
 
+// In-memory MVCC store that keeps every committed version per key.
 pub const MVCCEngine = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     versions: std.StringHashMap(std.ArrayList(Version)),
 
+    // Creates an empty version map protected by a mutex.
     pub fn init(allocator: std.mem.Allocator) MVCCEngine {
         return .{
             .allocator = allocator,
@@ -23,6 +27,7 @@ pub const MVCCEngine = struct {
         };
     }
 
+    // Releases all version chains and owned key/value buffers.
     pub fn deinit(self: *MVCCEngine) void {
         var it = self.versions.iterator();
         while (it.next()) |entry| {
@@ -33,6 +38,7 @@ pub const MVCCEngine = struct {
         self.versions.deinit();
     }
 
+    // Returns the version list for a key, creating it on first write.
     fn ensureKey(self: *MVCCEngine, key: []const u8) !*std.ArrayList(Version) {
         if (self.versions.getPtr(key)) |list| {
             return list;
@@ -44,6 +50,7 @@ pub const MVCCEngine = struct {
         return self.versions.getPtr(key).?;
     }
 
+    // Appends a visible value version at the supplied sequence number.
     pub fn put(self: *MVCCEngine, sequence: u64, key: []const u8, value: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -55,6 +62,7 @@ pub const MVCCEngine = struct {
         });
     }
 
+    // Appends a tombstone version so later snapshots treat the key as deleted.
     pub fn delete(self: *MVCCEngine, sequence: u64, key: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -66,6 +74,7 @@ pub const MVCCEngine = struct {
         });
     }
 
+    // Returns the newest version whose sequence is visible to the snapshot.
     pub fn get(self: *MVCCEngine, snapshot_sequence: u64, key: []const u8) MvccError![]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();

@@ -1,5 +1,7 @@
+//! Lock-free clock-style cache metadata that tracks shared slot ownership by hash.
 const std = @import("std");
 
+// Errors surfaced by cache admission and leak checks.
 pub const CacheError = error{
     CacheFull,
     ReferenceLeak,
@@ -16,16 +18,19 @@ const SlotState = enum(u3) {
     occupied = 1,
 };
 
+// One cache metadata slot: key identity plus packed acquire/release counters.
 pub const Slot = struct {
     key_hash: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     meta: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
+// Borrowed reference returned by fetch; callers must release it to clear the logical pin.
 pub const Handle = struct {
     cache: *ClockCache,
     slot_index: usize,
     released: bool = false,
 
+    // Marks the handle as released exactly once.
     pub fn release(self: *Handle) void {
         if (self.released) return;
         self.cache.incrementRelease(&self.cache.slots[self.slot_index]);
@@ -33,10 +38,12 @@ pub const Handle = struct {
     }
 };
 
+// Fixed-size cache directory that deduplicates hot keys onto shared slots without a global mutex.
 pub const ClockCache = struct {
     allocator: std.mem.Allocator,
     slots: []Slot,
 
+    // Allocates and zero-initializes the slot array.
     pub fn init(allocator: std.mem.Allocator, slot_count: usize) !ClockCache {
         const slots = try allocator.alloc(Slot, slot_count);
         for (slots) |*slot| slot.* = .{};
@@ -81,6 +88,7 @@ pub const ClockCache = struct {
         }
     }
 
+    // Finds or claims a slot for the key hash and returns a tracked handle.
     pub fn fetch(self: *ClockCache, key: []const u8) CacheError!Handle {
         const key_hash = std.hash.Wyhash.hash(0, key);
         var idx = @as(usize, @intCast(key_hash % self.slots.len));
@@ -124,6 +132,7 @@ pub const ClockCache = struct {
         return CacheError.CacheFull;
     }
 
+    // Exposes packed acquire/release counters for tests and diagnostics.
     pub fn inspectCounts(self: *ClockCache, slot_index: usize) struct { acquire: u32, release: u32, refs: u32 } {
         const meta = self.slots[slot_index].meta.load(.acquire);
         const acq: u32 = @intCast(meta & ACQUIRE_MASK);
@@ -131,6 +140,7 @@ pub const ClockCache = struct {
         return .{ .acquire = acq, .release = rel, .refs = acq - rel };
     }
 
+    // Verifies that every acquired handle has been released.
     pub fn assertNoLeaks(self: *ClockCache) CacheError!void {
         for (self.slots, 0..) |_, idx| {
             const c = self.inspectCounts(idx);
@@ -138,6 +148,7 @@ pub const ClockCache = struct {
         }
     }
 
+    // Counts how many slots currently advertise the same hashed key identity.
     pub fn countSlotsWithHash(self: *ClockCache, key_hash: u64) usize {
         var total: usize = 0;
         for (self.slots) |slot| {

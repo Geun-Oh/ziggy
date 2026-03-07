@@ -1,3 +1,4 @@
+//! Manifest snapshots and CURRENT pointer management for durable metadata versions.
 const std = @import("std");
 
 pub const ManifestError = error{
@@ -7,6 +8,7 @@ pub const ManifestError = error{
 
 pub const MAX_LEVELS = 7;
 
+// Metadata describing one SSTable tracked by the manifest.
 pub const FileMeta = struct {
     level: u8,
     file_number: u64,
@@ -14,6 +16,7 @@ pub const FileMeta = struct {
     min_key: []u8,
     max_key: []u8,
 
+    // Deep-copies file-range metadata so versions can be cloned safely.
     pub fn clone(self: FileMeta, allocator: std.mem.Allocator) !FileMeta {
         const min_copy = try allocator.dupe(u8, self.min_key);
         errdefer allocator.free(min_copy);
@@ -27,17 +30,20 @@ pub const FileMeta = struct {
         };
     }
 
+    // Releases owned min/max key buffers.
     pub fn deinit(self: FileMeta, allocator: std.mem.Allocator) void {
         allocator.free(self.min_key);
         allocator.free(self.max_key);
     }
 };
 
+// Reference to an SSTable that should be removed from a version.
 pub const DeletedFile = struct {
     level: u8,
     file_number: u64,
 };
 
+// Atomic metadata delta applied on top of the current VersionSet.
 pub const VersionEdit = struct {
     new_files: []const FileMeta,
     deleted_files: []const DeletedFile,
@@ -45,12 +51,14 @@ pub const VersionEdit = struct {
     next_file_number: ?u64 = null,
 };
 
+// Full in-memory view of the LSM tree state described by the manifest.
 pub const VersionSet = struct {
     allocator: std.mem.Allocator,
     levels: [MAX_LEVELS]std.ArrayList(FileMeta),
     next_sequence: u64,
     next_file_number: u64,
 
+    // Creates an empty version set with default monotonic counters.
     pub fn init(allocator: std.mem.Allocator) VersionSet {
         var levels: [MAX_LEVELS]std.ArrayList(FileMeta) = undefined;
         for (&levels) |*level| level.* = .empty;
@@ -62,6 +70,7 @@ pub const VersionSet = struct {
         };
     }
 
+    // Releases every tracked file metadata entry in every level.
     pub fn deinit(self: *VersionSet) void {
         for (&self.levels) |*level| {
             for (level.items) |meta| meta.deinit(self.allocator);
@@ -69,6 +78,7 @@ pub const VersionSet = struct {
         }
     }
 
+    // Applies file additions/removals and advances monotonic counters.
     pub fn applyEdit(self: *VersionSet, edit: VersionEdit) !void {
         for (edit.deleted_files) |deleted| {
             if (deleted.level >= MAX_LEVELS) continue;
@@ -93,6 +103,7 @@ pub const VersionSet = struct {
         if (edit.next_file_number) |num| self.next_file_number = num;
     }
 
+    // Deep-copies the full version so callers can stage atomic updates safely.
     pub fn clone(self: *const VersionSet, allocator: std.mem.Allocator) !VersionSet {
         var out = VersionSet.init(allocator);
         out.next_sequence = self.next_sequence;
@@ -107,6 +118,7 @@ pub const VersionSet = struct {
     }
 };
 
+// Writes CURRENT.tmp, fsyncs it, and renames it into CURRENT.
 fn writeCurrentAtomically(dir: std.fs.Dir, manifest_name: []const u8) !void {
     const tmp_name = "CURRENT.tmp";
 
@@ -121,10 +133,12 @@ fn writeCurrentAtomically(dir: std.fs.Dir, manifest_name: []const u8) !void {
     try dir.rename(tmp_name, "CURRENT");
 }
 
+// Formats the canonical MANIFEST file name for a file number.
 fn manifestNameFor(file_number: u64, buf: *[32]u8) []const u8 {
     return std.fmt.bufPrint(buf, "MANIFEST-{d:0>6}", .{file_number}) catch unreachable;
 }
 
+// Serializes the full VersionSet into the project's line-oriented manifest snapshot format.
 fn serializeSnapshot(allocator: std.mem.Allocator, version: *const VersionSet) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -148,6 +162,7 @@ fn serializeSnapshot(allocator: std.mem.Allocator, version: *const VersionSet) !
     return out.toOwnedSlice(allocator);
 }
 
+// Parses one manifest snapshot file back into an in-memory VersionSet.
 fn parseSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !VersionSet {
     var version = VersionSet.init(allocator);
     errdefer version.deinit();
@@ -191,6 +206,7 @@ fn parseSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !VersionSet {
     return version;
 }
 
+// Filesystem-backed manifest manager that writes snapshots and swaps CURRENT atomically.
 pub const ManifestStore = struct {
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -199,6 +215,7 @@ pub const ManifestStore = struct {
         return .{ .allocator = allocator, .dir = dir };
     }
 
+    // Creates the first manifest snapshot and points CURRENT at it.
     pub fn bootstrap(self: *ManifestStore, initial: *const VersionSet) !void {
         var name_buf: [32]u8 = undefined;
         const name = manifestNameFor(initial.next_file_number, &name_buf);
@@ -206,6 +223,7 @@ pub const ManifestStore = struct {
         try writeCurrentAtomically(self.dir, name);
     }
 
+    // Writes and fsyncs one manifest snapshot file.
     fn writeSnapshot(self: *ManifestStore, name: []const u8, version: *const VersionSet) !void {
         const content = try serializeSnapshot(self.allocator, version);
         defer self.allocator.free(content);
@@ -216,6 +234,7 @@ pub const ManifestStore = struct {
         try file.sync();
     }
 
+    // Writes a new snapshot, updates CURRENT, and then swaps the caller's in-memory version.
     pub fn applyEditAtomic(self: *ManifestStore, current: *VersionSet, edit: VersionEdit) !void {
         var next = try current.clone(self.allocator);
         errdefer next.deinit();
@@ -230,6 +249,7 @@ pub const ManifestStore = struct {
         current.* = next;
     }
 
+    // Test helper that writes a new manifest file without updating CURRENT.
     pub fn simulateCrashAfterManifestWrite(self: *ManifestStore, current: *VersionSet, edit: VersionEdit) !void {
         var next = try current.clone(self.allocator);
         defer next.deinit();
@@ -241,12 +261,14 @@ pub const ManifestStore = struct {
         try self.writeSnapshot(new_name, &next);
     }
 
+    // Loads a specific manifest snapshot file by name.
     fn tryLoadFromManifestName(self: *ManifestStore, name: []const u8) !VersionSet {
         const bytes = try self.dir.readFileAlloc(self.allocator, name, 1024 * 1024);
         defer self.allocator.free(bytes);
         return parseSnapshot(self.allocator, bytes);
     }
 
+    // Loads the version referenced by CURRENT or falls back to the newest valid manifest.
     pub fn loadVersionSet(self: *ManifestStore) !VersionSet {
         const current_name_raw = self.dir.readFileAlloc(self.allocator, "CURRENT", 1024) catch |err| switch (err) {
             error.FileNotFound => return self.loadFallbackManifest(),
@@ -260,6 +282,7 @@ pub const ManifestStore = struct {
         return self.tryLoadFromManifestName(current_name) catch ManifestError.InvalidManifest;
     }
 
+    // Scans all MANIFEST-* files and returns the newest valid snapshot.
     fn loadFallbackManifest(self: *ManifestStore) !VersionSet {
         var iter = self.dir.iterate();
         var names = std.ArrayList([]u8).empty;

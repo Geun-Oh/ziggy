@@ -1,16 +1,20 @@
+//! Read-path helpers: bloom filtering plus a k-way merge iterator for ordered sources.
 const std = @import("std");
 
+// Errors returned by lightweight read-path helpers.
 pub const AccessError = error{
     IteratorExhausted,
     OutOfMemory,
 };
 
+// Probabilistic membership filter used to skip obvious disk misses.
 pub const BloomFilter = struct {
     allocator: std.mem.Allocator,
     bits: []u8,
     bit_count: usize,
     hash_count: usize,
 
+    // Allocates the backing bitset and derives a bounded number of hash probes.
     pub fn init(allocator: std.mem.Allocator, key_count: usize, bits_per_key: usize) !BloomFilter {
         const bit_count = @max(64, key_count * bits_per_key);
         const byte_count = std.math.divCeil(usize, bit_count, 8) catch unreachable;
@@ -27,33 +31,39 @@ pub const BloomFilter = struct {
         };
     }
 
+    // Releases the bitset allocated by init.
     pub fn deinit(self: *BloomFilter) void {
         self.allocator.free(self.bits);
     }
 
+    // Derives the idx-th probe position from the key and hash seed.
     fn nthHash(self: *const BloomFilter, key: []const u8, idx: usize) usize {
         const h = std.hash.Wyhash.hash(@as(u64, idx) *% 0x9E3779B185EBCA87, key);
         return @as(usize, @intCast(h % self.bit_count));
     }
 
+    // Sets one bit inside the backing bitset.
     fn setBit(self: *BloomFilter, bit_index: usize) void {
         const byte_idx = bit_index / 8;
         const bit = @as(u3, @intCast(bit_index % 8));
         self.bits[byte_idx] |= (@as(u8, 1) << bit);
     }
 
+    // Tests one bit inside the backing bitset.
     fn testBit(self: *const BloomFilter, bit_index: usize) bool {
         const byte_idx = bit_index / 8;
         const bit = @as(u3, @intCast(bit_index % 8));
         return (self.bits[byte_idx] & (@as(u8, 1) << bit)) != 0;
     }
 
+    // Marks the hash positions for a key.
     pub fn add(self: *BloomFilter, key: []const u8) void {
         for (0..self.hash_count) |idx| {
             self.setBit(self.nthHash(key, idx));
         }
     }
 
+    // Returns false only when the key is definitely absent.
     pub fn mayContain(self: *const BloomFilter, key: []const u8) bool {
         for (0..self.hash_count) |idx| {
             if (!self.testBit(self.nthHash(key, idx))) return false;
@@ -62,6 +72,7 @@ pub const BloomFilter = struct {
     }
 };
 
+// Test-oriented wrapper that counts how often the bloom filter allows a disk read.
 pub const AccessProbe = struct {
     bloom: BloomFilter,
     disk_reads: usize = 0,
@@ -70,6 +81,7 @@ pub const AccessProbe = struct {
         self.bloom.deinit();
     }
 
+    // Simulates a guarded disk lookup and increments the read counter only on bloom hits.
     pub fn maybeReadFromDisk(self: *AccessProbe, key: []const u8) bool {
         if (!self.bloom.mayContain(key)) return false;
         self.disk_reads += 1;
@@ -77,6 +89,7 @@ pub const AccessProbe = struct {
     }
 };
 
+// One versioned key/value item flowing through the merge heap.
 pub const MergeItem = struct {
     key: []const u8,
     value: []const u8,
@@ -84,20 +97,24 @@ pub const MergeItem = struct {
     cursor_index: usize,
 };
 
+// Per-input cursor used by the merge iterator.
 pub const Cursor = struct {
     entries: []const MergeItem,
     index: usize = 0,
 
+    // Returns the current merge item for this input stream.
     fn current(self: *const Cursor) ?MergeItem {
         if (self.index >= self.entries.len) return null;
         return self.entries[self.index];
     }
 
+    // Advances the cursor by one item.
     fn advance(self: *Cursor) void {
         self.index += 1;
     }
 };
 
+// Heap ordering: smallest key first, newest sequence first for ties.
 fn lessThan(_: void, a: MergeItem, b: MergeItem) std.math.Order {
     const key_order = std.mem.order(u8, a.key, b.key);
     if (key_order != .eq) return key_order;
@@ -106,11 +123,13 @@ fn lessThan(_: void, a: MergeItem, b: MergeItem) std.math.Order {
     return .eq;
 }
 
+// Merges multiple already-sorted input streams while preferring newer sequence numbers per key.
 pub const KWayMergingIterator = struct {
     allocator: std.mem.Allocator,
     cursors: []Cursor,
     heap: std.PriorityQueue(MergeItem, void, lessThan),
 
+    // Seeds the priority queue with the first item from each input stream.
     pub fn init(allocator: std.mem.Allocator, inputs: []const []const MergeItem) !KWayMergingIterator {
         const cursors = try allocator.alloc(Cursor, inputs.len);
         for (inputs, 0..) |input, idx| {
@@ -143,6 +162,7 @@ pub const KWayMergingIterator = struct {
         self.allocator.free(self.cursors);
     }
 
+    // Returns the next globally ordered item and advances only the source that produced it.
     pub fn next(self: *KWayMergingIterator) AccessError!MergeItem {
         const item = self.heap.removeOrNull() orelse return AccessError.IteratorExhausted;
 

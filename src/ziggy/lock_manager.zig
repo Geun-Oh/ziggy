@@ -1,5 +1,7 @@
+//! Sharded key lock manager with a wait-for graph for simple deadlock detection.
 const std = @import("std");
 
+// Lock acquisition outcomes for contended transactions.
 pub const LockError = error{
     WouldBlock,
     DeadlockDetected,
@@ -14,17 +16,20 @@ const Stripe = struct {
     mutex: std.Thread.Mutex = .{},
     locks: std.StringHashMap(LockEntry),
 
+    // Creates one stripe-local lock table.
     fn init(allocator: std.mem.Allocator) Stripe {
         return .{ .locks = std.StringHashMap(LockEntry).init(allocator) };
     }
 };
 
+// Coordinates per-key ownership across striped hash maps.
 pub const LockManager = struct {
     allocator: std.mem.Allocator,
     stripes: []Stripe,
     wait_for_mutex: std.Thread.Mutex,
     wait_for: std.AutoHashMap(u64, u64), // waiter -> owner
 
+    // Allocates the stripe array and wait-for graph.
     pub fn init(allocator: std.mem.Allocator, stripe_count: usize) !LockManager {
         const stripes = try allocator.alloc(Stripe, stripe_count);
         for (stripes) |*s| s.* = Stripe.init(allocator);
@@ -37,6 +42,7 @@ pub const LockManager = struct {
         };
     }
 
+    // Releases all stripe-local lock entries and the wait-for graph.
     pub fn deinit(self: *LockManager) void {
         for (self.stripes) |*stripe| {
             var it = stripe.locks.iterator();
@@ -50,10 +56,12 @@ pub const LockManager = struct {
         self.wait_for.deinit();
     }
 
+    // Maps a key onto a stripe so unrelated keys can proceed concurrently.
     pub fn stripeFor(self: *const LockManager, key: []const u8) usize {
         return @as(usize, @intCast(std.hash.Wyhash.hash(0, key) % self.stripes.len));
     }
 
+    // Walks the wait-for graph and returns the newest transaction in a discovered cycle.
     fn detectCycleVictim(self: *LockManager, start: u64) !?u64 {
         var queue = std.ArrayList(u64).empty;
         defer queue.deinit(self.allocator);
@@ -91,6 +99,7 @@ pub const LockManager = struct {
         return null;
     }
 
+    // Grants the lock, records a wait edge, or rejects the newest participant in a deadlock cycle.
     pub fn acquire(self: *LockManager, txn_id: u64, key: []const u8) !void {
         const stripe_id = self.stripeFor(key);
         var stripe = &self.stripes[stripe_id];
@@ -131,6 +140,7 @@ pub const LockManager = struct {
         return LockError.WouldBlock;
     }
 
+    // Releases ownership and hands the lock to the next waiter if one exists.
     pub fn release(self: *LockManager, txn_id: u64, key: []const u8) !void {
         const stripe_id = self.stripeFor(key);
         var stripe = &self.stripes[stripe_id];
@@ -157,6 +167,7 @@ pub const LockManager = struct {
     }
 };
 
+// Finds two generated keys that hash to different stripes for concurrency tests.
 fn findDistinctStripeKeys(manager: *LockManager, allocator: std.mem.Allocator) !struct { a: []u8, b: []u8 } {
     const first_key = try std.fmt.allocPrint(allocator, "k-{d}", .{0});
     const first_stripe = manager.stripeFor(first_key);
