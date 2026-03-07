@@ -3,6 +3,49 @@
 `ziggy` is an **LSM-tree-based embedded key-value storage engine** implemented in Zig.
 The repository now includes a usable integrated `Engine` API and operator-facing CLI on top of the core storage building blocks.
 
+## Install
+
+### One-line installer
+
+Install the latest release for your current OS/architecture:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | sh
+```
+
+Install a specific version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | VERSION=v0.1.1 sh
+```
+
+Default install location:
+
+- `~/.local/bin/ziggy`
+
+Override the install directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | INSTALL_DIR=/usr/local/bin sh
+```
+
+### Manual download
+
+Download the right archive from GitHub Releases for your platform:
+
+- `ziggy-x86_64-linux.tar.gz`
+- `ziggy-aarch64-linux.tar.gz`
+- `ziggy-x86_64-macos.tar.gz`
+- `ziggy-aarch64-macos.tar.gz`
+
+Example:
+
+```bash
+curl -L https://github.com/Geun-Oh/ziggy/releases/latest/download/ziggy-aarch64-macos.tar.gz -o ziggy.tar.gz
+tar -xzf ziggy.tar.gz
+./ziggy-aarch64-macos/ziggy open --path ./data
+```
+
 ## What this project provides
 
 - WAL (Write-Ahead Log) framing, checksums, and replay
