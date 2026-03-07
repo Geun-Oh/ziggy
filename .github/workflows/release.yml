@@ -49,7 +49,10 @@ jobs:
           cp zig-out/bin/ziggy dist/${{ matrix.artifact }}/ziggy
           cp README.md LICENSE dist/${{ matrix.artifact }}/
           tar -C dist -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
-          shasum -a 256 dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
+          (
+            cd dist
+            shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+          )
 
       - name: Native smoke test
         if: matrix.smoke

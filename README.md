@@ -61,6 +61,8 @@ tar -xzf ziggy.tar.gz
 
 ### Verify installation
 
+The installer verifies release checksums automatically when a `.sha256` file is present.
+
 ```bash
 ziggy open --path ./data
 ziggy put --path ./data --key hello --value world

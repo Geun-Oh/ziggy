@@ -142,12 +142,14 @@ fetch_to_file "$archive_url" "$TMP_DIR/$archive_name"
 
 if fetch_to_file "$checksum_url" "$TMP_DIR/$checksum_name" 2>/dev/null; then
   echo "Verifying checksum..."
+  checksum_tmp="$TMP_DIR/${checksum_name}.normalized"
+  sed "s#  .*${archive_name}#  ${archive_name}#" "$TMP_DIR/$checksum_name" > "$checksum_tmp"
   (
     cd "$TMP_DIR"
     if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum -c "$checksum_name"
+      sha256sum -c "$(basename "$checksum_tmp")"
     elif command -v shasum >/dev/null 2>&1; then
-      shasum -a 256 -c "$checksum_name"
+      shasum -a 256 -c "$(basename "$checksum_tmp")"
     else
       echo "warning: sha256sum/shasum not found, skipped checksum verification" >&2
     fi
