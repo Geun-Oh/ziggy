@@ -15,7 +15,7 @@ artifacts/
 ENGINE_GET_AUDIT.md
 _write_ahead_log.md
 
-# Other
-.omx
-.pi-*
-_write_ahead_log.md
+# Local planning/spec docs kept out of git tracking
+SPEC.md
+TASK.md
+TRACEABILITY.md
