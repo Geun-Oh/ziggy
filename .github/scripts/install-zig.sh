@@ -22,7 +22,7 @@ esac
 
 if [ ! -x "${INSTALL_DIR}/zig" ]; then
   mkdir -p "$CACHE_DIR"
-  archive="zig-${zig_os}-${zig_arch}-${ZIG_VERSION}.tar.xz"
+  archive="zig-${zig_arch}-${zig_os}-${ZIG_VERSION}.tar.xz"
   url="https://ziglang.org/download/${ZIG_VERSION}/${archive}"
   tmp_archive="${CACHE_DIR}/${archive}"
   rm -f "$tmp_archive"
