@@ -1,5 +1,7 @@
+//! WAL framing, checksumming, decoding, and durable append helpers.
 const std = @import("std");
 const builtin = @import("builtin");
+const cbytes = @import("comptime_bytes.zig");
 
 pub const BLOCK_SIZE: usize = 32 * 1024;
 pub const HEADER_SIZE: usize = 7;
@@ -23,18 +25,21 @@ pub const DurabilityMode = enum {
     o_direct,
 };
 
+// Tunables for how the durable WAL file is opened and flushed.
 pub const DurableWalConfig = struct {
     mode: DurabilityMode = .fdatasync,
     inject_sync_failure: bool = false,
     inject_direct_open_failure: bool = false,
 };
 
+// Record fragment markers compatible with block-oriented WAL framing.
 pub const FragmentType = enum(u8) {
     full = 1,
     first = 2,
     middle = 3,
     last = 4,
 
+    // Converts an on-disk fragment marker into the enum representation.
     pub fn fromByte(b: u8) WalError!FragmentType {
         return switch (b) {
             1 => .full,
@@ -46,10 +51,12 @@ pub const FragmentType = enum(u8) {
     }
 };
 
+// Convenience wrapper around the CRC32C implementation used by WAL checksums.
 fn crc32c(bytes: []const u8) u32 {
     return std.hash.crc.Crc32Iscsi.hash(bytes);
 }
 
+// Computes the checksum over the fragment type byte plus payload bytes.
 fn fragmentChecksum(ty: FragmentType, payload: []const u8) u32 {
     var hasher = std.hash.crc.Crc32Iscsi.init();
     const ty_byte: [1]u8 = .{@intFromEnum(ty)};
@@ -58,29 +65,31 @@ fn fragmentChecksum(ty: FragmentType, payload: []const u8) u32 {
     return hasher.final();
 }
 
+// Reads a little-endian u16 from a byte slice.
 fn readU16Le(bytes: []const u8, pos: usize) u16 {
-    return @as(u16, bytes[pos]) |
-        (@as(u16, bytes[pos + 1]) << 8);
+    return cbytes.readIntLe(u16, bytes, pos) catch unreachable;
 }
 
+// Reads a little-endian u32 from a byte slice.
 fn readU32Le(bytes: []const u8, pos: usize) u32 {
-    return @as(u32, bytes[pos]) |
-        (@as(u32, bytes[pos + 1]) << 8) |
-        (@as(u32, bytes[pos + 2]) << 16) |
-        (@as(u32, bytes[pos + 3]) << 24);
+    return cbytes.readIntLe(u32, bytes, pos) catch unreachable;
 }
 
+// In-memory WAL builder that fragments large logical records into physical frames.
 pub const WalWriter = struct {
     bytes: std.ArrayList(u8),
 
+    // Creates an empty in-memory WAL writer.
     pub fn init() WalWriter {
         return .{ .bytes = .empty };
     }
 
+    // Releases the accumulated WAL byte buffer.
     pub fn deinit(self: *WalWriter, allocator: std.mem.Allocator) void {
         self.bytes.deinit(allocator);
     }
 
+    // Splits one logical record across block boundaries and appends checksummed fragments.
     pub fn appendRecord(self: *WalWriter, allocator: std.mem.Allocator, payload: []const u8) !void {
         var offset: usize = 0;
         var first = true;
@@ -129,17 +138,20 @@ pub const WalWriter = struct {
         }
     }
 
+    // Returns the accumulated framed WAL bytes.
     pub fn asSlice(self: *const WalWriter) []const u8 {
         return self.bytes.items;
     }
 };
 
+// File-backed WAL appender that persists framed records to disk.
 pub const DurableWal = struct {
     file: std.fs.File,
     config: DurableWalConfig,
     direct_open_used: bool,
     fdatasync_calls: usize,
 
+    // Opens the WAL file using either fdatasync-backed writes or a direct-I/O path.
     pub fn init(dir: std.fs.Dir, path: []const u8, config: DurableWalConfig) WalIoError!DurableWal {
         switch (config.mode) {
             .fdatasync => {
@@ -182,10 +194,12 @@ pub const DurableWal = struct {
         }
     }
 
+    // Closes the WAL file descriptor.
     pub fn deinit(self: *DurableWal) void {
         self.file.close();
     }
 
+    // Frames, writes, and flushes one logical record.
     pub fn appendRecord(self: *DurableWal, allocator: std.mem.Allocator, payload: []const u8) WalIoError!void {
         var framed = WalWriter.init();
         defer framed.deinit(allocator);
@@ -195,6 +209,7 @@ pub const DurableWal = struct {
         try self.flush();
     }
 
+    // Persists the most recent write according to the selected durability mode.
     fn flush(self: *DurableWal) WalIoError!void {
         switch (self.config.mode) {
             .fdatasync => {
@@ -207,6 +222,7 @@ pub const DurableWal = struct {
     }
 };
 
+// Decodes just the physical fragment markers from a WAL byte stream.
 pub fn decodeFragmentTypes(allocator: std.mem.Allocator, bytes: []const u8) ![]FragmentType {
     var out = std.ArrayList(FragmentType).empty;
     errdefer out.deinit(allocator);
@@ -241,6 +257,7 @@ pub fn decodeFragmentTypes(allocator: std.mem.Allocator, bytes: []const u8) ![]F
     return out.toOwnedSlice(allocator);
 }
 
+// Validates checksums and reconstructs full logical records from the byte stream.
 pub fn readAllRecords(allocator: std.mem.Allocator, bytes: []const u8) ![][]u8 {
     var records = std.ArrayList([]u8).empty;
     errdefer {

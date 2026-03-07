@@ -1,7 +1,10 @@
+//! Integrated LSM-tree engine that ties together WAL, memtables, manifests, scans, and background jobs.
 const std = @import("std");
 const builtin = @import("builtin");
 const wal = @import("wal.zig");
 const manifest = @import("manifest.zig");
+const platform = @import("platform.zig");
+const cbytes = @import("comptime_bytes.zig");
 
 pub const EngineError = error{
     InvalidConfig,
@@ -15,8 +18,10 @@ pub const EngineError = error{
     UnknownProperty,
     WriteStall,
     UnsupportedFormat,
+    IncompleteCheckpoint,
 };
 
+// Runtime configuration for a database instance.
 pub const Config = struct {
     path: []const u8,
     durability_mode: wal.DurabilityMode = .fdatasync,
@@ -31,21 +36,58 @@ pub const Config = struct {
     compaction_rate_bytes_per_sec: u64 = 8 * 1024 * 1024,
 };
 
+// Typed property payload returned by the property() inspection API.
 pub const PropertyValue = union(enum) {
     u64: u64,
     text: []const u8,
 };
 
+// Materialized row returned by scan APIs.
 pub const ScanItem = struct {
     key: []u8,
     value: []u8,
 };
 
+// Half-open range bounds used by general scans: [start, end).
+pub const ScanBounds = struct {
+    start: ?[]const u8 = null,
+    end: ?[]const u8 = null,
+};
+
+// Small summary surfaced by the stats command.
 pub const EngineStats = struct {
     key_count: usize,
     next_sequence: u64,
     wal_size_bytes: u64,
 };
+
+pub const BatchOp = struct {
+    op: Op,
+    key: []const u8,
+    value: []const u8 = "",
+};
+
+pub const Snapshot = struct {
+    seq: u64,
+};
+
+pub const ErrorClass = enum {
+    retryable,
+    busy,
+    corruption,
+    fatal,
+    not_found,
+};
+
+pub fn classifyError(err: anyerror) ErrorClass {
+    return switch (err) {
+        EngineError.WriteStall, EngineError.LockHeld => .busy,
+        EngineError.CorruptedWalRecord, EngineError.UnsupportedFormat => .corruption,
+        EngineError.KeyNotFound => .not_found,
+        EngineError.EngineClosed => .retryable,
+        else => .fatal,
+    };
+}
 
 const StallState = enum {
     normal,
@@ -87,7 +129,10 @@ const latency_bucket_bounds_us = [_]u64{ 10, 50, 100, 250, 500, 1_000, 2_500, 5_
 const sst_format_major: u64 = 1;
 const sst_format_minor: u64 = 0;
 const sst_format_minor_max_compatible: u64 = 1;
+const checkpoint_incomplete_marker = "CHECKPOINT_INCOMPLETE";
+const checkpoint_complete_marker = "CHECKPOINT_COMPLETE";
 
+// Fixed bucket histogram used for exported latency percentiles.
 const LatencyHistogram = struct {
     buckets: [latency_bucket_bounds_us.len + 1]u64 = [_]u64{0} ** (latency_bucket_bounds_us.len + 1),
     count: u64 = 0,
@@ -126,6 +171,7 @@ const LatencyHistogram = struct {
     }
 };
 
+// Monotonic counters and latency summaries for observability properties.
 const RuntimeMetrics = struct {
     put_count: u64 = 0,
     delete_count: u64 = 0,
@@ -148,6 +194,7 @@ const RuntimeMetrics = struct {
     scan_latency: LatencyHistogram = .{},
 };
 
+// Simple token bucket that rate-limits background compaction I/O.
 const TokenBucket = struct {
     rate_bytes_per_sec: u64,
     burst: f64,
@@ -187,6 +234,7 @@ const TokenBucket = struct {
     }
 };
 
+// Full database runtime: open files, mutable state, scheduler queues, workers, and metrics.
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -236,9 +284,11 @@ pub const Engine = struct {
 
     io_limiter: TokenBucket,
     metrics: RuntimeMetrics,
+    scan_test_delay_ns: u64,
 
     mutex: std.Thread.Mutex,
 
+    // Opens the database directory, acquires the single-writer lock, reloads metadata, and replays the WAL.
     pub fn open(allocator: std.mem.Allocator, config: Config) !Engine {
         if (config.path.len == 0) return EngineError.InvalidConfig;
         if (config.memtable_max_bytes == 0) return EngineError.InvalidConfig;
@@ -247,11 +297,22 @@ pub const Engine = struct {
         if (config.slowdown_l0_files > config.stop_l0_files) return EngineError.InvalidConfig;
         if (config.slowdown_immutable_count > config.stop_immutable_count) return EngineError.InvalidConfig;
 
+        const caps = platform.capabilities();
+        if (!caps.supported) return EngineError.UnsupportedPlatform;
+
         var dir = try std.fs.cwd().makeOpenPath(config.path, .{ .iterate = true });
         errdefer dir.close();
 
         const lock_file = try acquireLock(dir);
         errdefer lock_file.close();
+
+        dir.access(checkpoint_incomplete_marker, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return EngineError.IncompleteCheckpoint,
+        };
+        if (dir.access(checkpoint_incomplete_marker, .{})) |_| {
+            return EngineError.IncompleteCheckpoint;
+        } else |_| {}
 
         var store = manifest.ManifestStore.init(allocator, dir);
         var version = store.loadVersionSet() catch |err| switch (err) {
@@ -320,12 +381,14 @@ pub const Engine = struct {
             .compaction_worker_cond = .{},
             .io_limiter = TokenBucket.init(config.compaction_rate_bytes_per_sec),
             .metrics = .{},
+            .scan_test_delay_ns = 0,
             .mutex = .{},
         };
 
         return engine;
     }
 
+    // Drains background work, persists the final manifest counters, and releases filesystem resources.
     pub fn close(self: *Engine) !void {
         self.mutex.lock();
         if (self.closed) {
@@ -379,202 +442,275 @@ pub const Engine = struct {
         self.dir.close();
     }
 
+    // Appends a value mutation to the WAL and applies it to the active memtable.
     pub fn put(self: *Engine, key: []const u8, value: []const u8) !void {
-        if (key.len > self.max_key_size) return error.KeyTooLarge;
-        try self.ensureWorkersStarted();
-        const op_start: u64 = @intCast(std.time.nanoTimestamp());
-
-        var slowed_once = false;
-        while (true) {
-            self.mutex.lock();
-            try self.ensureOpenLocked();
-            const pre = self.preWriteActionLocked();
-            if (pre == .stop) {
-                self.metrics.stall_count += 1;
-                self.mutex.unlock();
-                return EngineError.WriteStall;
-            }
-            if (pre == .slowdown and !slowed_once) {
-                slowed_once = true;
-                self.mutex.unlock();
-                const start = std.time.nanoTimestamp();
-                std.Thread.sleep(1 * std.time.ns_per_ms);
-                const elapsed: u64 = @intCast(std.time.nanoTimestamp() - start);
-                self.mutex.lock();
-                self.metrics.stall_duration_ns_total += elapsed;
-                self.mutex.unlock();
-                continue;
-            }
-
-            const seq = self.next_sequence;
-            const encoded = try encodeRecord(self.allocator, .put, seq, key, value);
-            defer self.allocator.free(encoded);
-
-            const start = std.time.nanoTimestamp();
-            try appendFramed(self, encoded);
-            self.metrics.wal_bytes_appended += @as(u64, @intCast(encoded.len));
-            try applyMutation(self, seq, .put, key, value);
-            self.next_sequence += 1;
-            self.metrics.put_count += 1;
-            const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
-            self.metrics.write_latency_ns_total += elapsed_ns;
-            if (elapsed_ns > self.metrics.write_latency_ns_max) self.metrics.write_latency_ns_max = elapsed_ns;
-            self.metrics.put_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-
-            try self.maybeRotateActiveLocked();
-            self.refreshStallStateLocked();
-
-            self.mutex.unlock();
-            return;
-        }
+        const one = BatchOp{ .op = .put, .key = key, .value = value };
+        return self.writeBatch(&.{one});
     }
 
+    // Appends a tombstone mutation and updates in-memory visibility state.
     pub fn delete(self: *Engine, key: []const u8) !void {
+        const one = BatchOp{ .op = .delete, .key = key, .value = "" };
+        return self.writeBatch(&.{one});
+    }
+
+    pub fn writeBatch(self: *Engine, ops: []const BatchOp) !void {
+        if (ops.len == 0) return;
         try self.ensureWorkersStarted();
+
+        for (ops) |op| {
+            if (op.key.len > self.max_key_size) return error.KeyTooLarge;
+            if (op.op == .put and op.value.len > std.math.maxInt(u32)) return EngineError.InvalidConfig;
+        }
+
         const op_start: u64 = @intCast(std.time.nanoTimestamp());
         var slowed_once = false;
+
         while (true) {
             self.mutex.lock();
+            var lock_held = true;
+            errdefer if (lock_held) self.mutex.unlock();
+
             try self.ensureOpenLocked();
+
             const pre = self.preWriteActionLocked();
             if (pre == .stop) {
                 self.metrics.stall_count += 1;
                 self.mutex.unlock();
+                lock_held = false;
                 return EngineError.WriteStall;
             }
+
             if (pre == .slowdown and !slowed_once) {
                 slowed_once = true;
                 self.mutex.unlock();
-                const start = std.time.nanoTimestamp();
+                lock_held = false;
+
+                const s = std.time.nanoTimestamp();
                 std.Thread.sleep(1 * std.time.ns_per_ms);
-                const elapsed: u64 = @intCast(std.time.nanoTimestamp() - start);
+                const elapsed: u64 = @intCast(std.time.nanoTimestamp() - s);
+
                 self.mutex.lock();
                 self.metrics.stall_duration_ns_total += elapsed;
                 self.mutex.unlock();
                 continue;
             }
 
-            const seq = self.next_sequence;
-            const encoded = try encodeRecord(self.allocator, .delete, seq, key, "");
+            const seq_base = self.next_sequence;
+            const encoded = if (ops.len == 1)
+                try encodeRecord(self.allocator, ops[0].op, seq_base, ops[0].key, ops[0].value)
+            else
+                try encodeBatchRecord(self.allocator, seq_base, ops);
             defer self.allocator.free(encoded);
 
             const start = std.time.nanoTimestamp();
             try appendFramed(self, encoded);
             self.metrics.wal_bytes_appended += @as(u64, @intCast(encoded.len));
-            try applyMutation(self, seq, .delete, key, "");
-            self.next_sequence += 1;
-            self.metrics.delete_count += 1;
+
+            var seq = seq_base;
+            var put_count: u64 = 0;
+            var del_count: u64 = 0;
+            for (ops) |op| {
+                try applyMutation(self, seq, op.op, op.key, op.value);
+                seq += 1;
+                switch (op.op) {
+                    .put => put_count += 1,
+                    .delete => del_count += 1,
+                }
+            }
+            self.next_sequence = seq;
+
+            self.metrics.put_count += put_count;
+            self.metrics.delete_count += del_count;
+
             const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
             self.metrics.write_latency_ns_total += elapsed_ns;
             if (elapsed_ns > self.metrics.write_latency_ns_max) self.metrics.write_latency_ns_max = elapsed_ns;
-            self.metrics.delete_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
+
+            if (ops.len == 1) {
+                const op_elapsed: u64 = @intCast(std.time.nanoTimestamp() - op_start);
+                switch (ops[0].op) {
+                    .put => self.metrics.put_latency.observeNs(op_elapsed),
+                    .delete => self.metrics.delete_latency.observeNs(op_elapsed),
+                }
+            }
 
             try self.maybeRotateActiveLocked();
             self.refreshStallStateLocked();
 
             self.mutex.unlock();
+            lock_held = false;
             return;
         }
     }
 
+    // Reads the newest visible value for a key across mutable, immutable, and SST sources.
     pub fn get(self: *Engine, key: []const u8) ![]u8 {
         return self.getInternal(key, null, true);
     }
 
+    pub fn beginSnapshot(self: *Engine) !Snapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.ensureOpenLocked();
+        const seq = if (self.next_sequence == 0) 0 else self.next_sequence - 1;
+        return .{ .seq = seq };
+    }
+
+    pub fn getSnapshot(self: *Engine, s: Snapshot, key: []const u8) ![]u8 {
+        return self.getInternal(key, s.seq, false);
+    }
+
+    pub fn releaseSnapshot(self: *Engine, s: Snapshot) void {
+        _ = self;
+        _ = s; // reserved for the future Snapshot
+    }
+
+    // Internal snapshot read used by tests and scan visibility checks.
     fn getAtSnapshot(self: *Engine, key: []const u8, snapshot_seq: u64) ![]u8 {
         return self.getInternal(key, snapshot_seq, false);
     }
 
+    // Shared point-read path that merges memory and disk sources under one visibility rule.
     fn getInternal(self: *Engine, key: []const u8, snapshot_seq: ?u64, count_metrics: bool) ![]u8 {
         const op_start: u64 = @intCast(std.time.nanoTimestamp());
+
         self.mutex.lock();
+        var lock_held = true;
+        errdefer if (lock_held) self.mutex.unlock();
+
         try self.ensureOpenLocked();
         if (count_metrics) self.metrics.get_count += 1;
 
-        if (lookupVisibleMap(&self.active_mem, key, snapshot_seq)) |entry| {
-            const res = entryToGetResult(self, entry);
-            if (res) |v| {
-                if (count_metrics) self.metrics.get_hit_count += 1;
-                if (count_metrics) self.metrics.get_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-                self.mutex.unlock();
-                return v;
-            }
-            if (count_metrics) self.metrics.get_miss_count += 1;
-            if (count_metrics) self.metrics.get_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-            self.mutex.unlock();
-            return EngineError.KeyNotFound;
+        const effective_snapshot_seq = snapshot_seq orelse if (self.next_sequence == 0) 0 else self.next_sequence - 1;
+
+        var sources = std.ArrayList(ScanSource).empty;
+        defer {
+            for (sources.items) |*src| src.deinit(self.allocator);
+            sources.deinit(self.allocator);
+        }
+
+        if (try collectMemPointSource(self.allocator, &self.active_mem, key)) |src| {
+            try sources.append(self.allocator, src);
         }
 
         var idx = self.immutables.items.len;
         while (idx > 0) {
             idx -= 1;
-            if (lookupVisibleMap(&self.immutables.items[idx].map, key, snapshot_seq)) |entry| {
-                const res = entryToGetResult(self, entry);
-                if (res) |v| {
-                    if (count_metrics) self.metrics.get_hit_count += 1;
-                    if (count_metrics) self.metrics.get_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-                    self.mutex.unlock();
-                    return v;
-                }
-                if (count_metrics) self.metrics.get_miss_count += 1;
-                if (count_metrics) self.metrics.get_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-                self.mutex.unlock();
-                return EngineError.KeyNotFound;
+            if (try collectMemPointSource(self.allocator, &self.immutables.items[idx].map, key)) |src| {
+                try sources.append(self.allocator, src);
             }
         }
 
         var snapshot = try self.version.clone(self.allocator);
         self.mutex.unlock();
+        lock_held = false;
         defer snapshot.deinit();
 
-        const disk_entry = try lookupDisk(self.allocator, self.dir, &snapshot, key, snapshot_seq);
-        if (disk_entry) |entry| {
-            defer if (entry.value) |v| self.allocator.free(v);
-            if (entry.tombstone) {
-                self.mutex.lock();
-                if (count_metrics) self.metrics.get_miss_count += 1;
-                if (count_metrics) self.metrics.get_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-                self.mutex.unlock();
-                return EngineError.KeyNotFound;
-            }
-            const out = try self.allocator.dupe(u8, entry.value orelse "");
-            self.mutex.lock();
-            if (count_metrics) self.metrics.get_hit_count += 1;
-            if (count_metrics) self.metrics.get_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-            self.mutex.unlock();
-            return out;
-        }
+        const exact_end = try makeExactKeyEnd(self.allocator, key);
+        defer self.allocator.free(exact_end);
+        try collectDiskScanSources(self.allocator, self.dir, &snapshot, .{ .start = key, .end = exact_end }, &sources);
+
+        const winner = selectVisibleWinnerForKey(sources.items, key, effective_snapshot_seq);
+        const out = if (winner) |entry|
+            if (entry.tombstone)
+                null
+            else
+                try self.allocator.dupe(u8, entry.value orelse "")
+        else
+            null;
 
         self.mutex.lock();
-        if (count_metrics) self.metrics.get_miss_count += 1;
+        defer self.mutex.unlock();
         if (count_metrics) self.metrics.get_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
-        self.mutex.unlock();
+
+        if (out) |value| {
+            if (count_metrics) self.metrics.get_hit_count += 1;
+            return value;
+        }
+
+        if (count_metrics) self.metrics.get_miss_count += 1;
         return EngineError.KeyNotFound;
     }
 
+    // Releases a value buffer returned by get().
     pub fn freeValue(self: *Engine, value: []u8) void {
         self.allocator.free(value);
     }
 
+    // Scans all keys sharing a prefix by translating it into half-open bounds when possible.
     pub fn scanPrefix(self: *Engine, prefix: []const u8) ![]ScanItem {
+        const prefix_end = try makePrefixEnd(self.allocator, prefix);
+        defer if (prefix_end) |end| self.allocator.free(end);
+
+        if (prefix_end == null and prefix.len > 0) {
+            const rows = try self.scan(.{ .start = prefix });
+            errdefer self.freeScan(rows);
+
+            var out = std.ArrayList(ScanItem).empty;
+            errdefer {
+                for (out.items) |it| {
+                    self.allocator.free(it.key);
+                    self.allocator.free(it.value);
+                }
+                out.deinit(self.allocator);
+            }
+
+            for (rows) |row| {
+                if (!std.mem.startsWith(u8, row.key, prefix)) continue;
+                try out.append(self.allocator, .{
+                    .key = try self.allocator.dupe(u8, row.key),
+                    .value = try self.allocator.dupe(u8, row.value),
+                });
+            }
+            self.freeScan(rows);
+            return out.toOwnedSlice(self.allocator);
+        }
+
+        return self.scan(.{
+            .start = prefix,
+            .end = prefix_end,
+        });
+    }
+
+    // Produces a snapshot-consistent ordered range scan across memory and SST sources.
+    pub fn scan(self: *Engine, bounds: ScanBounds) ![]ScanItem {
+        if (bounds.start) |start| {
+            if (bounds.end) |end| {
+                if (std.mem.order(u8, start, end) == .gt) return EngineError.InvalidConfig;
+            }
+        }
+
         const op_start: u64 = @intCast(std.time.nanoTimestamp());
         self.mutex.lock();
         try self.ensureOpenLocked();
         self.metrics.scan_count += 1;
 
-        var selected = std.StringHashMap(ValueEntry).init(self.allocator);
-        errdefer deinitMap(self.allocator, &selected);
+        var sources = std.ArrayList(ScanSource).empty;
+        errdefer {
+            for (sources.items) |*src| src.deinit(self.allocator);
+            sources.deinit(self.allocator);
+        }
 
-        try mergeMapByPrefix(self.allocator, &selected, &self.active_mem, prefix);
+        if (try collectMemScanSource(self.allocator, &self.active_mem, bounds)) |src| {
+            try sources.append(self.allocator, src);
+        }
         for (self.immutables.items) |*im| {
-            try mergeMapByPrefix(self.allocator, &selected, &im.map, prefix);
+            if (try collectMemScanSource(self.allocator, &im.map, bounds)) |src| {
+                try sources.append(self.allocator, src);
+            }
         }
 
         var snapshot = try self.version.clone(self.allocator);
+        const snapshot_seq = if (self.next_sequence == 0) 0 else self.next_sequence - 1;
         self.mutex.unlock();
         defer snapshot.deinit();
 
-        try mergeDiskByPrefix(self.allocator, self.dir, &snapshot, prefix, &selected);
+        if (builtin.is_test and self.scan_test_delay_ns > 0) {
+            std.Thread.sleep(self.scan_test_delay_ns);
+        }
+
+        try collectDiskScanSources(self.allocator, self.dir, &snapshot, bounds, &sources);
 
         var out = std.ArrayList(ScanItem).empty;
         errdefer {
@@ -585,22 +721,26 @@ pub const Engine = struct {
             out.deinit(self.allocator);
         }
 
-        var it = selected.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.tombstone) continue;
-            try out.append(self.allocator, .{
-                .key = try self.allocator.dupe(u8, entry.key_ptr.*),
-                .value = try self.allocator.dupe(u8, entry.value_ptr.value orelse ""),
-            });
+        while (pickNextScanKey(sources.items)) |next_key| {
+            if (selectVisibleWinnerForKey(sources.items, next_key, snapshot_seq)) |winner| {
+                if (!winner.tombstone) {
+                    try out.append(self.allocator, .{
+                        .key = try self.allocator.dupe(u8, winner.key),
+                        .value = try self.allocator.dupe(u8, winner.value orelse ""),
+                    });
+                }
+            }
+
+            for (sources.items) |*src| {
+                const entry = src.current() orelse continue;
+                if (!std.mem.eql(u8, entry.key, next_key)) continue;
+                try src.advance();
+            }
         }
 
-        std.mem.sort(ScanItem, out.items, {}, struct {
-            fn lessThan(_: void, a: ScanItem, b: ScanItem) bool {
-                return std.mem.order(u8, a.key, b.key) == .lt;
-            }
-        }.lessThan);
+        for (sources.items) |*src| src.deinit(self.allocator);
+        sources.deinit(self.allocator);
 
-        deinitMap(self.allocator, &selected);
         const result = try out.toOwnedSlice(self.allocator);
         self.mutex.lock();
         self.metrics.scan_latency.observeNs(@intCast(std.time.nanoTimestamp() - op_start));
@@ -608,6 +748,7 @@ pub const Engine = struct {
         return result;
     }
 
+    // Releases a result set returned by scan or scanPrefix.
     pub fn freeScan(self: *Engine, items: []ScanItem) void {
         for (items) |it| {
             self.allocator.free(it.key);
@@ -616,6 +757,7 @@ pub const Engine = struct {
         self.allocator.free(items);
     }
 
+    // Computes a small live-state summary without reading every SST from disk.
     pub fn stats(self: *Engine) !EngineStats {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -638,11 +780,22 @@ pub const Engine = struct {
         return .{ .key_count = count, .next_sequence = self.next_sequence, .wal_size_bytes = stat.size };
     }
 
+    // Returns one typed diagnostic property or metric by name.
     pub fn property(self: *Engine, name: []const u8) !PropertyValue {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         try self.ensureOpenLocked();
+
+        const caps = platform.capabilities();
+        if (std.mem.eql(u8, name, "engine.platform.os")) return .{ .text = @tagName(caps.os_tag) };
+        if (std.mem.eql(u8, name, "engine.platform.arch")) return .{ .text = @tagName(caps.arch) };
+        if (std.mem.eql(u8, name, "engine.platform.tier")) return .{ .text = @tagName(caps.tier) };
+        if (std.mem.eql(u8, name, "engine.platform.pointer_bits")) return .{ .u64 = caps.pointer_bits };
+        if (std.mem.eql(u8, name, "engine.platform.supported")) return .{ .u64 = @intFromBool(caps.supported) };
+        if (std.mem.eql(u8, name, "engine.platform.checkpoint_atomic_noreplace")) return .{ .u64 = @intFromBool(caps.has_linux_renameat2_noreplace) };
+        if (std.mem.eql(u8, name, "engine.platform.checkpoint_portable_reservation")) return .{ .u64 = @intFromBool(!caps.has_linux_renameat2_noreplace and caps.has_posix_nofollow_open) };
+        if (std.mem.eql(u8, name, "engine.platform.direct_io_path")) return .{ .u64 = @intFromBool(caps.has_direct_io_path) };
 
         if (std.mem.eql(u8, name, "engine.memtable.bytes")) {
             var total = self.active_mem_bytes;
@@ -694,6 +847,7 @@ pub const Engine = struct {
         return EngineError.UnknownProperty;
     }
 
+    // Copies the current on-disk state into a fresh checkpoint directory after path safety checks.
     pub fn checkpoint(self: *Engine, path: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -708,6 +862,12 @@ pub const Engine = struct {
         const parent_path = std.fs.path.dirname(path) orelse ".";
         var parent = try openDirNoSymlinkChain(self.allocator, parent_path);
         defer parent.close();
+
+        const caps = platform.capabilities();
+        if (!caps.has_linux_renameat2_noreplace) {
+            try createPortableCheckpoint(self.allocator, self.dir, parent, dst_name);
+            return;
+        }
 
         const tmp_name = try std.fmt.allocPrint(self.allocator, ".ziggy-checkpoint-{d}", .{std.time.microTimestamp()});
         defer self.allocator.free(tmp_name);
@@ -724,14 +884,16 @@ pub const Engine = struct {
         var it = self.dir.iterate();
         while (try it.next()) |entry| {
             if (entry.kind != .file) continue;
-            if (!std.mem.startsWith(u8, entry.name, "MANIFEST-")) continue;
+            const is_manifest = std.mem.startsWith(u8, entry.name, "MANIFEST-");
+            const is_sst = std.mem.startsWith(u8, entry.name, "sst-") and std.mem.endsWith(u8, entry.name, ".sst");
+            if (!is_manifest and !is_sst) continue;
             try copyFile(self.allocator, self.dir, tmp_dst, entry.name);
-            if (std.mem.startsWith(u8, entry.name, "sst-")) try copyFile(self.allocator, self.dir, tmp_dst, entry.name);
         }
 
         try renameNoReplace(self.allocator, parent, tmp_name, dst_name);
     }
 
+    // Validates manifest readability and WAL frame integrity for operator diagnostics.
     pub fn doctor(self: *Engine) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -756,10 +918,12 @@ pub const Engine = struct {
         for (records) |record| _ = decodeRecord(record) catch return EngineError.CorruptedWalRecord;
     }
 
+    // Fails fast when an API is used after close().
     fn ensureOpenLocked(self: *Engine) !void {
         if (self.closed) return EngineError.EngineClosed;
     }
 
+    // Lazily starts the flush and compaction threads on the first write.
     fn ensureWorkersStarted(self: *Engine) !void {
         self.mutex.lock();
         if (self.workers_started) {
@@ -784,6 +948,7 @@ pub const Engine = struct {
         self.compaction_thread = try std.Thread.spawn(.{}, compactionWorkerMain, .{self});
     }
 
+    // Signals both background workers, wakes them, and joins their threads.
     fn stopWorkers(self: *Engine) void {
         self.flush_stop.store(true, .release);
         self.compaction_stop.store(true, .release);
@@ -812,6 +977,7 @@ pub const Engine = struct {
         self.mutex.unlock();
     }
 
+    // Marks flush work as pending and wakes the flush worker.
     fn signalFlushWorker(self: *Engine) void {
         self.flush_worker_mutex.lock();
         self.flush_pending = true;
@@ -819,6 +985,7 @@ pub const Engine = struct {
         self.flush_worker_mutex.unlock();
     }
 
+    // Marks compaction work as pending and wakes the compaction worker.
     fn signalCompactionWorker(self: *Engine) void {
         self.compaction_worker_mutex.lock();
         self.compaction_pending = true;
@@ -826,6 +993,7 @@ pub const Engine = struct {
         self.compaction_worker_mutex.unlock();
     }
 
+    // Queues one immutable memtable for flush and enforces scheduler backpressure.
     fn enqueueFlushLocked(self: *Engine, mem_id: u64) !void {
         if (self.flush_queue.items.len >= self.queue_limit) {
             self.stall_state = .stop;
@@ -836,6 +1004,7 @@ pub const Engine = struct {
         self.signalFlushWorker();
     }
 
+    // Adds at most one pending compaction job per level.
     fn enqueueCompactionLocked(self: *Engine, level: u8) !void {
         if (self.compaction_queue.items.len >= self.queue_limit) return;
         for (self.compaction_queue.items) |existing| if (existing == level) return;
@@ -843,6 +1012,7 @@ pub const Engine = struct {
         self.signalCompactionWorker();
     }
 
+    // Swaps the active memtable into the immutable queue once it crosses the byte budget.
     fn maybeRotateActiveLocked(self: *Engine) !void {
         if (self.active_mem_bytes < self.memtable_max_bytes) return;
 
@@ -857,6 +1027,7 @@ pub const Engine = struct {
         try self.enqueueFlushLocked(imm.id);
     }
 
+    // Computes whether the next write should proceed, sleep briefly, or fail with backpressure.
     fn preWriteActionLocked(self: *Engine) PreWrite {
         self.refreshStallStateLocked();
         return switch (self.stall_state) {
@@ -866,6 +1037,7 @@ pub const Engine = struct {
         };
     }
 
+    // Re-evaluates write stall state from queue depth, immutable count, and L0 pressure.
     fn refreshStallStateLocked(self: *Engine) void {
         if (self.flush_queue.items.len >= self.queue_limit or self.compaction_queue.items.len >= self.queue_limit) {
             self.stall_state = .stop;
@@ -900,6 +1072,7 @@ pub const Engine = struct {
         self.stall_reason = .none;
     }
 
+    // Pops the oldest queued immutable memtable flush job.
     fn popFlushJob(self: *Engine) ?u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -907,6 +1080,7 @@ pub const Engine = struct {
         return self.flush_queue.orderedRemove(0);
     }
 
+    // Pops the oldest queued compaction level.
     fn popCompactionJob(self: *Engine) ?u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -914,6 +1088,7 @@ pub const Engine = struct {
         return self.compaction_queue.orderedRemove(0);
     }
 
+    // Background loop that drains immutable memtable flush requests.
     fn flushWorkerMain(self: *Engine) void {
         while (true) {
             if (self.popFlushJob()) |id| {
@@ -932,6 +1107,7 @@ pub const Engine = struct {
         }
     }
 
+    // Background loop that drains queued compaction requests.
     fn compactionWorkerMain(self: *Engine) void {
         while (true) {
             if (self.popCompactionJob()) |level| {
@@ -950,6 +1126,7 @@ pub const Engine = struct {
         }
     }
 
+    // Converts one immutable memtable into an L0 SST and records it in the manifest.
     fn flushImmutable(self: *Engine, mem_id: u64) !void {
         var imm_opt: ?ImmutableMem = null;
 
@@ -999,6 +1176,7 @@ pub const Engine = struct {
         self.refreshStallStateLocked();
     }
 
+    // Compacts all current L0 files into one L1 file, honoring the I/O rate limiter.
     fn compactLevel(self: *Engine, level: u8) !void {
         if (level != 0) return;
 
@@ -1078,11 +1256,172 @@ pub const Engine = struct {
     }
 };
 
+// One decoded record read from an SST file.
 const SstEntry = struct {
     key: []u8,
     seq: u64,
     tombstone: bool,
     value: ?[]u8,
+};
+
+// Unified scan record shape shared by memory and SST scan sources.
+const ScanEntry = struct {
+    key: []u8,
+    seq: u64,
+    tombstone: bool,
+    value: ?[]u8,
+};
+
+// Eager in-memory scan source backed by a sorted slice.
+const MemScanSource = struct {
+    entries: []ScanEntry,
+    index: usize = 0,
+
+    // Returns the current in-memory scan row, if any.
+    fn current(self: *const MemScanSource) ?*const ScanEntry {
+        if (self.index >= self.entries.len) return null;
+        return &self.entries[self.index];
+    }
+
+    // Moves to the next in-memory scan row.
+    fn advance(self: *MemScanSource) void {
+        if (self.index < self.entries.len) self.index += 1;
+    }
+
+    // Frees all key/value buffers owned by the materialized memory scan source.
+    fn deinit(self: *MemScanSource, allocator: std.mem.Allocator) void {
+        for (self.entries) |entry| {
+            allocator.free(entry.key);
+            if (entry.value) |v| allocator.free(v);
+        }
+        allocator.free(self.entries);
+    }
+};
+
+const max_sst_scan_line_bytes: usize = 4 * 1024 * 1024;
+
+// Streaming SST scan source that advances line-by-line within requested bounds.
+const SstScanSource = struct {
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    reader: std.fs.File.Reader,
+    read_buf: [4096]u8,
+    bounds: ScanBounds,
+    done: bool = false,
+    current_entry: ?ScanEntry = null,
+
+    // Opens one SST file, validates its header, and positions at the first in-range entry.
+    fn init(allocator: std.mem.Allocator, dir: std.fs.Dir, file_number: u64, bounds: ScanBounds) !SstScanSource {
+        var name_buf: [64]u8 = undefined;
+        const file_name = try std.fmt.bufPrint(&name_buf, "sst-{d}.sst", .{file_number});
+        const file = try dir.openFile(file_name, .{});
+
+        var out = SstScanSource{
+            .allocator = allocator,
+            .file = file,
+            .reader = undefined,
+            .read_buf = undefined,
+            .bounds = bounds,
+        };
+        out.reader = out.file.reader(&out.read_buf);
+
+        const header_line = (try out.reader.interface.takeDelimiter('\n')) orelse return EngineError.UnsupportedFormat;
+        if (header_line.len > max_sst_scan_line_bytes) return error.StreamTooLong;
+        try validateSstHeaderLine(header_line);
+
+        try out.advance();
+        return out;
+    }
+
+    // Returns the currently buffered SST entry.
+    fn current(self: *const SstScanSource) ?*const ScanEntry {
+        if (self.done) return null;
+        return if (self.current_entry) |*entry| entry else null;
+    }
+
+    // Streams forward until it finds the next entry that falls inside the scan bounds.
+    fn advance(self: *SstScanSource) !void {
+        self.clearCurrent();
+        if (self.done) return;
+
+        while (true) {
+            const line = (try self.reader.interface.takeDelimiter('\n')) orelse {
+                self.done = true;
+                return;
+            };
+            if (line.len == 0) continue;
+
+            var tok = std.mem.splitScalar(u8, line, '\t');
+            const seq_txt = tok.next() orelse continue;
+            const tomb_txt = tok.next() orelse continue;
+            const key_txt = tok.next() orelse continue;
+            const val_txt = tok.next() orelse "";
+
+            if (self.bounds.start) |start| {
+                if (std.mem.order(u8, key_txt, start) == .lt) continue;
+            }
+            if (self.bounds.end) |end| {
+                if (std.mem.order(u8, key_txt, end) != .lt) {
+                    self.done = true;
+                    return;
+                }
+            }
+
+            const tombstone = std.mem.eql(u8, tomb_txt, "1");
+            self.current_entry = .{
+                .key = try self.allocator.dupe(u8, key_txt),
+                .seq = try std.fmt.parseUnsigned(u64, seq_txt, 10),
+                .tombstone = tombstone,
+                .value = if (tombstone) null else try self.allocator.dupe(u8, val_txt),
+            };
+            return;
+        }
+    }
+
+    // Releases the currently buffered SST entry before moving on.
+    fn clearCurrent(self: *SstScanSource) void {
+        if (self.current_entry) |entry| {
+            self.allocator.free(entry.key);
+            if (entry.value) |v| self.allocator.free(v);
+            self.current_entry = null;
+        }
+    }
+
+    // Frees the buffered entry and closes the SST file handle.
+    fn deinit(self: *SstScanSource) void {
+        self.clearCurrent();
+        self.file.close();
+    }
+};
+
+// Polymorphic scan source used by the merge-style scan implementation.
+const ScanSource = union(enum) {
+    mem: MemScanSource,
+    sst: SstScanSource,
+
+    // Returns the current item regardless of whether the source is memory-backed or file-backed.
+    fn current(self: *const ScanSource) ?*const ScanEntry {
+        return switch (self.*) {
+            .mem => |*src| src.current(),
+            .sst => |*src| src.current(),
+        };
+    }
+
+    // Advances the active source by one logical row.
+    fn advance(self: *ScanSource) !void {
+        switch (self.*) {
+            .mem => |*src| src.advance(),
+            .sst => |*src| try src.advance(),
+        }
+    }
+
+    // Releases resources owned by the active scan source variant.
+    fn deinit(self: *ScanSource, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .mem => |*src| src.deinit(allocator),
+            .sst => |*src| src.deinit(),
+        }
+    }
 };
 
 const Decoded = struct {
@@ -1092,10 +1431,12 @@ const Decoded = struct {
     value: []const u8,
 };
 
+// Reads the raw latest value entry for a key from one in-memory map.
 fn lookupMap(map: *std.StringHashMap(ValueEntry), key: []const u8) ?ValueEntry {
     return map.get(key);
 }
 
+// Applies snapshot filtering on top of lookupMap.
 fn lookupVisibleMap(map: *std.StringHashMap(ValueEntry), key: []const u8, snapshot_seq: ?u64) ?ValueEntry {
     const entry = lookupMap(map, key) orelse return null;
     if (snapshot_seq) |snap| {
@@ -1104,11 +1445,13 @@ fn lookupVisibleMap(map: *std.StringHashMap(ValueEntry), key: []const u8, snapsh
     return entry;
 }
 
+// Converts an internal value entry into an owned API return buffer unless it is tombstoned.
 fn entryToGetResult(self: *Engine, entry: ValueEntry) ?[]u8 {
     if (entry.tombstone) return null;
     return self.allocator.dupe(u8, entry.value orelse "") catch null;
 }
 
+// Keeps only the newest sequence for each key while merging SST contents.
 fn mergeEntry(allocator: std.mem.Allocator, map: *std.StringHashMap(ValueEntry), key: []const u8, entry: SstEntry) !void {
     if (map.getPtr(key)) |existing| {
         if (entry.seq <= existing.seq) return;
@@ -1133,6 +1476,7 @@ fn mergeEntry(allocator: std.mem.Allocator, map: *std.StringHashMap(ValueEntry),
     });
 }
 
+// Merges visible in-memory entries matching a prefix while keeping the newest sequence per key.
 fn mergeMapByPrefix(allocator: std.mem.Allocator, dst: *std.StringHashMap(ValueEntry), src: *std.StringHashMap(ValueEntry), prefix: []const u8) !void {
     var it = src.iterator();
     while (it.next()) |entry| {
@@ -1156,12 +1500,183 @@ fn mergeMapByPrefix(allocator: std.mem.Allocator, dst: *std.StringHashMap(ValueE
     }
 }
 
+// Merges in-memory entries that fall inside explicit scan bounds.
+fn mergeMapByBounds(allocator: std.mem.Allocator, dst: *std.StringHashMap(ValueEntry), src: *std.StringHashMap(ValueEntry), bounds: ScanBounds) !void {
+    var it = src.iterator();
+    while (it.next()) |entry| {
+        if (!keyInBounds(entry.key_ptr.*, bounds)) continue;
+        if (dst.getPtr(entry.key_ptr.*)) |existing| {
+            if (entry.value_ptr.seq <= existing.seq) continue;
+            if (existing.value) |v| allocator.free(v);
+            existing.seq = entry.value_ptr.seq;
+            existing.tombstone = entry.value_ptr.tombstone;
+            existing.value = if (entry.value_ptr.value) |v| try allocator.dupe(u8, v) else null;
+            continue;
+        }
+
+        const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key_copy);
+        try dst.put(key_copy, .{
+            .seq = entry.value_ptr.seq,
+            .tombstone = entry.value_ptr.tombstone,
+            .value = if (entry.value_ptr.value) |v| try allocator.dupe(u8, v) else null,
+        });
+    }
+}
+
+// Materializes one memtable map into a sorted scan source restricted to the requested bounds.
+fn collectMemScanSource(allocator: std.mem.Allocator, map: *std.StringHashMap(ValueEntry), bounds: ScanBounds) !?ScanSource {
+    var list = std.ArrayList(ScanEntry).empty;
+    errdefer {
+        for (list.items) |entry| {
+            allocator.free(entry.key);
+            if (entry.value) |v| allocator.free(v);
+        }
+        list.deinit(allocator);
+    }
+
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (!keyInBounds(entry.key_ptr.*, bounds)) continue;
+        try list.append(allocator, .{
+            .key = try allocator.dupe(u8, entry.key_ptr.*),
+            .seq = entry.value_ptr.seq,
+            .tombstone = entry.value_ptr.tombstone,
+            .value = if (entry.value_ptr.value) |v| try allocator.dupe(u8, v) else null,
+        });
+    }
+
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return null;
+    }
+
+    std.mem.sort(ScanEntry, list.items, {}, struct {
+        fn lessThan(_: void, a: ScanEntry, b: ScanEntry) bool {
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    }.lessThan);
+
+    return .{ .mem = .{ .entries = try list.toOwnedSlice(allocator) } };
+}
+
+// Builds a single-entry scan source for exact key lookups from an in-memory map.
+fn collectMemPointSource(allocator: std.mem.Allocator, map: *std.StringHashMap(ValueEntry), key: []const u8) !?ScanSource {
+    const entry = map.get(key) orelse return null;
+
+    const key_copy = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_copy);
+
+    const value_copy = if (entry.value) |v| try allocator.dupe(u8, v) else null;
+    errdefer if (value_copy) |v| allocator.free(v);
+
+    const one = try allocator.alloc(ScanEntry, 1);
+    one[0] = .{
+        .key = key_copy,
+        .seq = entry.seq,
+        .tombstone = entry.tombstone,
+        .value = value_copy,
+    };
+
+    return .{ .mem = .{ .entries = one } };
+}
+
+// Returns whether a sequence number is visible to the chosen snapshot.
+fn entryVisibleAtSnapshot(seq: u64, snapshot_seq: u64) bool {
+    return seq <= snapshot_seq;
+}
+
+// Chooses the highest-sequence visible version of one key across all active scan sources.
+fn selectVisibleWinnerForKey(sources: []ScanSource, key: []const u8, snapshot_seq: u64) ?*const ScanEntry {
+    var best: ?*const ScanEntry = null;
+    for (sources) |*src| {
+        const entry = src.current() orelse continue;
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        if (!entryVisibleAtSnapshot(entry.seq, snapshot_seq)) continue;
+        if (best == null or entry.seq > best.?.seq) {
+            best = entry;
+        }
+    }
+    return best;
+}
+
+// Produces a half-open upper bound that captures exactly one key in scan space.
+fn makeExactKeyEnd(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    var out = try allocator.alloc(u8, key.len + 1);
+    @memcpy(out[0..key.len], key);
+    out[key.len] = 0;
+    return out;
+}
+
+// Computes the smallest exclusive upper bound for a byte-string prefix.
+fn makePrefixEnd(allocator: std.mem.Allocator, prefix: []const u8) !?[]u8 {
+    if (prefix.len == 0) return null;
+
+    var i = prefix.len;
+    while (i > 0) {
+        i -= 1;
+        if (prefix[i] == 0xFF) continue;
+
+        var out = try allocator.alloc(u8, i + 1);
+        @memcpy(out[0..i], prefix[0..i]);
+        out[i] = prefix[i] + 1;
+        return out;
+    }
+
+    return null;
+}
+
+// Opens scan sources only for SST files whose key ranges overlap the requested bounds.
+fn collectDiskScanSources(allocator: std.mem.Allocator, dir: std.fs.Dir, version: *manifest.VersionSet, bounds: ScanBounds, out: *std.ArrayList(ScanSource)) !void {
+    var l0_idx = version.levels[0].items.len;
+    while (l0_idx > 0) {
+        l0_idx -= 1;
+        const f = version.levels[0].items[l0_idx];
+        if (!fileOverlapsBounds(bounds, f.min_key, f.max_key)) continue;
+        const src = SstScanSource.init(allocator, dir, f.file_number, bounds) catch continue;
+        if (src.current() == null) {
+            var tmp = src;
+            tmp.deinit();
+            continue;
+        }
+        try out.append(allocator, .{ .sst = src });
+    }
+
+    var level: usize = 1;
+    while (level < manifest.MAX_LEVELS) : (level += 1) {
+        for (version.levels[level].items) |f| {
+            if (!fileOverlapsBounds(bounds, f.min_key, f.max_key)) continue;
+            const src = SstScanSource.init(allocator, dir, f.file_number, bounds) catch continue;
+            if (src.current() == null) {
+                var tmp = src;
+                tmp.deinit();
+                continue;
+            }
+            try out.append(allocator, .{ .sst = src });
+        }
+    }
+}
+
+// Finds the smallest current key across all scan sources.
+fn pickNextScanKey(sources: []ScanSource) ?[]const u8 {
+    var min_key: ?[]const u8 = null;
+    for (sources) |*src| {
+        const entry = src.current() orelse continue;
+        if (min_key == null or std.mem.order(u8, entry.key, min_key.?) == .lt) {
+            min_key = entry.key;
+        }
+    }
+    return min_key;
+}
+
+// Sums the byte sizes of current L0 files as a rough compaction debt estimate.
 fn pendingCompactionBytesLocked(self: *const Engine) u64 {
     var total: u64 = 0;
     for (self.version.levels[0].items) |f| total += f.size;
     return total;
 }
 
+// Flushes a sorted map into the project's simple line-oriented SST file format.
 fn writeSstFromMap(self: *Engine, level: u8, file_number: u64, map: *std.StringHashMap(ValueEntry)) !manifest.FileMeta {
     var items = std.ArrayList(struct { key: []const u8, value: ValueEntry }).empty;
     defer items.deinit(self.allocator);
@@ -1208,6 +1723,7 @@ fn writeSstFromMap(self: *Engine, level: u8, file_number: u64, map: *std.StringH
     };
 }
 
+// Reads an entire SST file into decoded entries for merge-style operations.
 fn readSstEntries(allocator: std.mem.Allocator, dir: std.fs.Dir, file_number: u64) ![]SstEntry {
     var name_buf: [64]u8 = undefined;
     const file_name = try std.fmt.bufPrint(&name_buf, "sst-{d}.sst", .{file_number});
@@ -1248,23 +1764,27 @@ fn readSstEntries(allocator: std.mem.Allocator, dir: std.fs.Dir, file_number: u6
     return out.toOwnedSlice(allocator);
 }
 
-fn validateSstSet(allocator: std.mem.Allocator, dir: std.fs.Dir, version: *manifest.VersionSet) !void {
+// Verifies that every manifest-referenced SST exists and advertises a supported header.
+fn validateSstSet(_: std.mem.Allocator, dir: std.fs.Dir, version: *manifest.VersionSet) !void {
     for (0..manifest.MAX_LEVELS) |level| {
         for (version.levels[level].items) |f| {
             var name_buf: [64]u8 = undefined;
             const file_name = try std.fmt.bufPrint(&name_buf, "sst-{d}.sst", .{f.file_number});
-            const bytes = dir.readFileAlloc(allocator, file_name, 256) catch |err| switch (err) {
+            var file = dir.openFile(file_name, .{}) catch |err| switch (err) {
                 error.FileNotFound => return EngineError.UnsupportedFormat,
                 else => return err,
             };
-            defer allocator.free(bytes);
+            defer file.close();
 
-            const eol = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
-            try validateSstHeaderLine(bytes[0..eol]);
+            var rbuf: [1024]u8 = undefined;
+            var reader = file.reader(&rbuf);
+            const header = (try reader.interface.takeDelimiter('\n')) orelse return EngineError.UnsupportedFormat;
+            try validateSstHeaderLine(header);
         }
     }
 }
 
+// Parses the project's SST header line and enforces format compatibility.
 fn validateSstHeaderLine(line: []const u8) !void {
     var tok = std.mem.tokenizeScalar(u8, line, ' ');
     const magic = tok.next() orelse return EngineError.UnsupportedFormat;
@@ -1285,6 +1805,7 @@ fn validateSstHeaderLine(line: []const u8) !void {
     if (minor > sst_format_minor_max_compatible) return EngineError.UnsupportedFormat;
 }
 
+// Searches SST files in read-precedence order for the newest visible version of one key.
 fn lookupDisk(allocator: std.mem.Allocator, dir: std.fs.Dir, version: *manifest.VersionSet, key: []const u8, snapshot_seq: ?u64) !?ValueEntry {
     var best: ?ValueEntry = null;
 
@@ -1306,6 +1827,7 @@ fn lookupDisk(allocator: std.mem.Allocator, dir: std.fs.Dir, version: *manifest.
     return best;
 }
 
+// Merges all disk-resident entries matching a prefix into one newest-version map.
 fn mergeDiskByPrefix(allocator: std.mem.Allocator, dir: std.fs.Dir, version: *manifest.VersionSet, prefix: []const u8, out: *std.StringHashMap(ValueEntry)) !void {
     for (0..manifest.MAX_LEVELS) |level| {
         for (version.levels[level].items) |f| {
@@ -1326,17 +1848,78 @@ fn mergeDiskByPrefix(allocator: std.mem.Allocator, dir: std.fs.Dir, version: *ma
     }
 }
 
+// Merges all overlapping disk files for an explicit range scan.
+fn mergeDiskByBounds(allocator: std.mem.Allocator, dir: std.fs.Dir, version: *manifest.VersionSet, bounds: ScanBounds, out: *std.StringHashMap(ValueEntry)) !void {
+    var l0_idx = version.levels[0].items.len;
+    while (l0_idx > 0) {
+        l0_idx -= 1;
+        const f = version.levels[0].items[l0_idx];
+        if (!fileOverlapsBounds(bounds, f.min_key, f.max_key)) continue;
+        try mergeFileByBounds(allocator, dir, f.file_number, bounds, out);
+    }
+
+    var level: usize = 1;
+    while (level < manifest.MAX_LEVELS) : (level += 1) {
+        for (version.levels[level].items) |f| {
+            if (!fileOverlapsBounds(bounds, f.min_key, f.max_key)) continue;
+            try mergeFileByBounds(allocator, dir, f.file_number, bounds, out);
+        }
+    }
+}
+
+// Reads one SST file and contributes only entries inside the requested bounds.
+fn mergeFileByBounds(allocator: std.mem.Allocator, dir: std.fs.Dir, file_number: u64, bounds: ScanBounds, out: *std.StringHashMap(ValueEntry)) !void {
+    const entries = readSstEntries(allocator, dir, file_number) catch return;
+    defer {
+        for (entries) |entry| {
+            allocator.free(entry.key);
+            if (entry.value) |v| allocator.free(v);
+        }
+        allocator.free(entries);
+    }
+
+    for (entries) |entry| {
+        if (!keyInBounds(entry.key, bounds)) continue;
+        try mergeEntry(allocator, out, entry.key, entry);
+    }
+}
+
+// Returns the first non-L0 file whose recorded key range could contain the key.
 fn findLevelCandidate(files: []manifest.FileMeta, key: []const u8) ?manifest.FileMeta {
     for (files) |f| if (keyInRange(key, f.min_key, f.max_key)) return f;
     return null;
 }
 
+// Checks inclusive file-range membership for a key.
 fn keyInRange(key: []const u8, min: []const u8, max: []const u8) bool {
     if (std.mem.order(u8, key, min) == .lt) return false;
     if (std.mem.order(u8, key, max) == .gt) return false;
     return true;
 }
 
+// Checks half-open scan-bound membership for a key.
+fn keyInBounds(key: []const u8, bounds: ScanBounds) bool {
+    if (bounds.start) |start| {
+        if (std.mem.order(u8, key, start) == .lt) return false;
+    }
+    if (bounds.end) |end| {
+        if (std.mem.order(u8, key, end) != .lt) return false;
+    }
+    return true;
+}
+
+// Checks whether a file range intersects a requested scan range.
+fn fileOverlapsBounds(bounds: ScanBounds, min: []const u8, max: []const u8) bool {
+    if (bounds.end) |end| {
+        if (std.mem.order(u8, end, min) != .gt) return false;
+    }
+    if (bounds.start) |start| {
+        if (std.mem.order(u8, start, max) == .gt) return false;
+    }
+    return true;
+}
+
+// Examines one SST and updates the current best visible value for an exact key.
 fn mergeBestFromFile(allocator: std.mem.Allocator, dir: std.fs.Dir, file_number: u64, key: []const u8, snapshot_seq: ?u64, best: *?ValueEntry) !void {
     const entries = readSstEntries(allocator, dir, file_number) catch return;
     defer {
@@ -1364,12 +1947,14 @@ fn mergeBestFromFile(allocator: std.mem.Allocator, dir: std.fs.Dir, file_number:
     }
 }
 
+// Best-effort deletion of an SST file after compaction or cleanup.
 fn deleteSstFile(dir: std.fs.Dir, file_number: u64) void {
     var name_buf: [64]u8 = undefined;
     const file_name = std.fmt.bufPrint(&name_buf, "sst-{d}.sst", .{file_number}) catch return;
     dir.deleteFile(file_name) catch {};
 }
 
+// Writes one logical mutation to wal.log using the same physical framing rules as wal.zig.
 fn appendFramed(self: *Engine, record: []const u8) !void {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(self.allocator);
@@ -1425,6 +2010,7 @@ fn appendFramed(self: *Engine, record: []const u8) !void {
     if (self.durability_mode == .fdatasync) try std.posix.fdatasync(self.wal_file.handle);
 }
 
+// Encodes the engine's logical WAL mutation record.
 fn encodeRecord(allocator: std.mem.Allocator, op: Op, seq: u64, key: []const u8, value: []const u8) ![]u8 {
     if (key.len > std.math.maxInt(u16) or value.len > std.math.maxInt(u32)) return EngineError.InvalidConfig;
 
@@ -1441,17 +2027,36 @@ fn encodeRecord(allocator: std.mem.Allocator, op: Op, seq: u64, key: []const u8,
     return out.toOwnedSlice(allocator);
 }
 
+const WAL_BATCH_TAG: u8 = 3;
+
+fn encodeBatchRecord(allocator: std.mem.Allocator, base_seq: u64, ops: []const BatchOp) ![]u8 {
+    if (ops.len == 0 or ops.len > std.math.maxInt(u16)) return EngineError.InvalidConfig;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    const w= out.writer(allocator);
+    try w.writeInt(u64, base_seq, .little);
+    try w.writeByte(WAL_BATCH_TAG);
+    try w.writeInt(u16, @intCast(ops.len), .little);
+
+    for (ops) |op| {
+        if (op.key.len > std.math.maxInt(u16) or op.value.len > std.math.maxInt(u32)) return EngineError.InvalidConfig;
+        try w.writeByte(@intFromEnum(op.op));
+        try w.writeInt(u16, @intCast(op.key.len), .little);
+        try w.writeInt(u32, @intCast(op.value.len), .little);
+        try out.appendSlice(allocator, op.key);
+        try out.appendSlice(allocator, op.value);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+// Parses one logical WAL record emitted by encodeRecord().
 fn decodeRecord(bytes: []const u8) !Decoded {
     if (bytes.len < 15) return EngineError.CorruptedWalRecord;
 
-    const seq = @as(u64, bytes[0]) |
-        (@as(u64, bytes[1]) << 8) |
-        (@as(u64, bytes[2]) << 16) |
-        (@as(u64, bytes[3]) << 24) |
-        (@as(u64, bytes[4]) << 32) |
-        (@as(u64, bytes[5]) << 40) |
-        (@as(u64, bytes[6]) << 48) |
-        (@as(u64, bytes[7]) << 56);
+    const seq = cbytes.readIntLe(u64, bytes, 0) catch return EngineError.CorruptedWalRecord;
 
     const op: Op = switch (bytes[8]) {
         1 => .put,
@@ -1459,20 +2064,18 @@ fn decodeRecord(bytes: []const u8) !Decoded {
         else => return EngineError.CorruptedWalRecord,
     };
 
-    const key_len = @as(usize, bytes[9]) | (@as(usize, bytes[10]) << 8);
-    const value_len = @as(usize, bytes[11]) |
-        (@as(usize, bytes[12]) << 8) |
-        (@as(usize, bytes[13]) << 16) |
-        (@as(usize, bytes[14]) << 24);
+    const key_len = cbytes.readIntLe(u16, bytes, 9) catch return EngineError.CorruptedWalRecord;
+    const value_len = cbytes.readIntLe(u32, bytes, 11) catch return EngineError.CorruptedWalRecord;
 
     const key_start = 15;
-    const key_end = key_start + key_len;
-    const value_end = key_end + value_len;
+    const key_end = key_start + @as(usize, key_len);
+    const value_end = key_end + @as(usize, value_len);
     if (value_end > bytes.len) return EngineError.CorruptedWalRecord;
 
     return .{ .seq = seq, .op = op, .key = bytes[key_start..key_end], .value = bytes[key_end..value_end] };
 }
 
+// Replays wal.log into the active memtable map during open().
 fn replayWal(
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -1493,16 +2096,74 @@ fn replayWal(
     }
 
     for (records) |record| {
-        const d = decodeRecord(record) catch return EngineError.CorruptedWalRecord;
-        try applyMapMutation(allocator, map, bytes_out, d.seq, d.op, d.key, d.value);
-        if (d.seq > max_seq_seen.*) max_seq_seen.* = d.seq;
+        try replayWalRecord(allocator, map, bytes_out, max_seq_seen, record);
     }
 }
 
+fn replayWalRecord(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMap(ValueEntry),
+    bytes_out: *u64,
+    max_seq_seen: *u64,
+    record: []const u8,
+) !void {
+    if (record.len < 9) return EngineError.CorruptedWalRecord;
+
+    const tag = record[8];
+
+    // legacy single-op
+    if (tag == 1 or tag == 2) {
+        const d = decodeRecord(record) catch return EngineError.CorruptedWalRecord;
+        try applyMapMutation(allocator, map, bytes_out, d.seq, d.op, d.key, d.value);
+        if (d.seq > max_seq_seen.*) max_seq_seen.* = d.seq;
+        return;
+    }
+
+    // batch-op
+    if (tag != WAL_BATCH_TAG) return EngineError.CorruptedWalRecord;
+    if (record.len < 11) return EngineError.CorruptedWalRecord;
+
+    const base_seq = cbytes.readIntLe(u64, record, 0) catch return EngineError.CorruptedWalRecord;
+    const count = cbytes.readIntLe(u16, record, 9) catch return EngineError.CorruptedWalRecord;
+
+    var pos: usize = 11;
+    var seq = base_seq;
+    var i: usize = 0;
+
+    while (i < count) : (i += 1) {
+        if (pos + 7 > record.len) return EngineError.CorruptedWalRecord;
+        const op_raw = record[pos];
+        const op: Op = switch (op_raw) {
+            1 => .put,
+            2 => .delete,
+            else => return EngineError.CorruptedWalRecord,
+        };
+        const key_len = cbytes.readIntLe(u16, record, pos + 1) catch return EngineError.CorruptedWalRecord;
+        const val_len = cbytes.readIntLe(u32, record, pos + 3) catch return EngineError.CorruptedWalRecord;
+        pos += 7;
+
+        const key_end = pos + @as(usize, key_len);
+        const val_end = key_end + @as(usize, val_len);
+        if (val_end > record.len) return EngineError.CorruptedWalRecord;
+
+        const key = record[pos..key_end];
+        const value = record[key_end..val_end];
+        pos = val_end;
+
+        try applyMapMutation(allocator, map, bytes_out, seq, op, key, value);
+        if (seq > max_seq_seen.*) max_seq_seen.* = seq;
+        seq += 1;
+    }
+
+    if (pos != record.len) return EngineError.CorruptedWalRecord;
+}
+
+// Applies a mutation directly into the active memtable state.
 fn applyMutation(self: *Engine, seq: u64, op: Op, key: []const u8, value: []const u8) !void {
     try applyMapMutation(self.allocator, &self.active_mem, &self.active_mem_bytes, seq, op, key, value);
 }
 
+// Applies a put/delete mutation into an in-memory version map and updates its byte budget.
 fn applyMapMutation(
     allocator: std.mem.Allocator,
     map: *std.StringHashMap(ValueEntry),
@@ -1535,6 +2196,7 @@ fn applyMapMutation(
     }
 }
 
+// Frees all keys and optional values owned by one in-memory version map.
 fn deinitMap(allocator: std.mem.Allocator, map: *std.StringHashMap(ValueEntry)) void {
     var it = map.iterator();
     while (it.next()) |entry| {
@@ -1544,11 +2206,13 @@ fn deinitMap(allocator: std.mem.Allocator, map: *std.StringHashMap(ValueEntry)) 
     map.deinit();
 }
 
+// Rejects zero or negative compaction bandwidth settings.
 fn validateCompactionRate(rate: i64) !u64 {
     if (rate <= 0) return EngineError.InvalidConfig;
     return @intCast(rate);
 }
 
+// Computes the same fragment checksum scheme used by wal.zig.
 fn walFragmentChecksum(ty: wal.FragmentType, payload: []const u8) u32 {
     var hasher = std.hash.crc.Crc32Iscsi.init();
     const ty_byte: [1]u8 = .{@intFromEnum(ty)};
@@ -1557,12 +2221,14 @@ fn walFragmentChecksum(ty: wal.FragmentType, payload: []const u8) u32 {
     return hasher.final();
 }
 
+// Opens the single-writer LOCK file and acquires a non-blocking exclusive flock.
 fn acquireLock(dir: std.fs.Dir) !std.fs.File {
     const file = try dir.createFile("LOCK", .{ .truncate = false, .read = true });
     std.posix.flock(file.handle, std.posix.LOCK.EX | std.posix.LOCK.NB) catch return EngineError.LockHeld;
     return file;
 }
 
+// Copies one named file into a checkpoint directory and fsyncs the destination.
 fn copyFile(allocator: std.mem.Allocator, src_dir: std.fs.Dir, dst_dir: std.fs.Dir, name: []const u8) !void {
     const bytes = try src_dir.readFileAlloc(allocator, name, 128 * 1024 * 1024);
     defer allocator.free(bytes);
@@ -1573,12 +2239,14 @@ fn copyFile(allocator: std.mem.Allocator, src_dir: std.fs.Dir, dst_dir: std.fs.D
     try file.sync();
 }
 
+// Rejects checkpoint paths containing explicit .. traversal segments.
 fn containsParentTraversal(path: []const u8) bool {
     var it = std.mem.tokenizeScalar(u8, path, '/');
     while (it.next()) |part| if (std.mem.eql(u8, part, "..")) return true;
     return false;
 }
 
+// Opens each checkpoint path component with NOFOLLOW semantics to reject symlink traversal.
 fn openDirNoSymlinkChain(allocator: std.mem.Allocator, path: []const u8) !std.fs.Dir {
     const flags = std.posix.O{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
 
@@ -1612,8 +2280,11 @@ fn openDirNoSymlinkChain(allocator: std.mem.Allocator, path: []const u8) !std.fs
 
 const checkpoint_rename_noreplace_flag: u32 = 1;
 
+// Renames a checkpoint directory only if the destination name does not already exist.
 fn renameNoReplace(allocator: std.mem.Allocator, parent: std.fs.Dir, old_name: []const u8, new_name: []const u8) !void {
-    if (builtin.os.tag != .linux) return EngineError.UnsupportedPlatform;
+    if (builtin.os.tag != .linux) {
+        return EngineError.UnsupportedPlatform;
+    }
 
     const old_z = try allocator.dupeZ(u8, old_name);
     defer allocator.free(old_z);
@@ -1630,6 +2301,404 @@ fn renameNoReplace(allocator: std.mem.Allocator, parent: std.fs.Dir, old_name: [
         .NOTDIR => return error.NotDir,
         .ACCES => return error.AccessDenied,
         else => |errno_code| return std.posix.unexpectedErrno(errno_code),
+    }
+}
+
+fn writeCheckpointMarker(dir: std.fs.Dir, name: []const u8, content: []const u8) !void {
+    var file = try dir.createFile(name, .{ .truncate = true, .exclusive = false });
+    defer file.close();
+    try file.writeAll(content);
+    try file.sync();
+}
+
+fn removeCheckpointMarker(dir: std.fs.Dir, name: []const u8) void {
+    dir.deleteFile(name) catch {};
+}
+
+fn createPortableCheckpoint(
+    allocator: std.mem.Allocator,
+    src_dir: std.fs.Dir,
+    parent: std.fs.Dir,
+    dst_name: []const u8,
+) !void {
+    parent.makeDir(dst_name) catch |err| switch (err) {
+        error.PathAlreadyExists => return EngineError.CheckpointAlreadyExists,
+        else => return err,
+    };
+    errdefer parent.deleteTree(dst_name) catch {};
+
+    var dst = try parent.openDir(dst_name, .{});
+    defer dst.close();
+
+    try writeCheckpointMarker(dst, checkpoint_incomplete_marker, "copying\n");
+
+    try copyFile(allocator, src_dir, dst, "wal.log");
+    try copyFile(allocator, src_dir, dst, "CURRENT");
+
+    var it = src_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const is_manifest = std.mem.startsWith(u8, entry.name, "MANIFEST-");
+        const is_sst = std.mem.startsWith(u8, entry.name, "sst-") and std.mem.endsWith(u8, entry.name, ".sst");
+        if (!is_manifest and !is_sst) continue;
+        try copyFile(allocator, src_dir, dst, entry.name);
+    }
+
+    try writeCheckpointMarker(dst, checkpoint_complete_marker, "complete\n");
+    removeCheckpointMarker(dst, checkpoint_incomplete_marker);
+}
+
+test "task 7.1 positive: open put get delete scan close reopen preserves data" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try Engine.open(allocator, .{ .path = db_path, .memtable_max_bytes = 4 * 1024 * 1024, .compaction_trigger_l0_files = 1000 });
+        defer eng.close() catch {};
+
+        var i: usize = 0;
+        while (i < 1000) : (i += 1) {
+            var kbuf: [32]u8 = undefined;
+            var vbuf: [32]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "k-{d}", .{i});
+            const v = try std.fmt.bufPrint(&vbuf, "v-{d}", .{i});
+            try eng.put(k, v);
+        }
+
+        const v42 = try eng.get("k-42");
+        defer eng.freeValue(v42);
+        try std.testing.expectEqualStrings("v-42", v42);
+
+        const rows = try eng.scanPrefix("k-9");
+        defer eng.freeScan(rows);
+        try std.testing.expect(rows.len > 0);
+
+        try eng.delete("k-42");
+        try std.testing.expectError(EngineError.KeyNotFound, eng.get("k-42"));
+    }
+
+    {
+        var reopened = try Engine.open(allocator, .{ .path = db_path });
+        defer reopened.close() catch {};
+
+        const v999 = try reopened.get("k-999");
+        defer reopened.freeValue(v999);
+        try std.testing.expectEqualStrings("v-999", v999);
+        try std.testing.expectError(EngineError.KeyNotFound, reopened.get("k-42"));
+    }
+}
+
+test "task 7.1 negative: second writer open fails with lock error" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try std.testing.expectError(EngineError.LockHeld, Engine.open(allocator, .{ .path = db_path }));
+}
+
+test "task 7.2 negative: corrupted wal fails open deterministically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try Engine.open(allocator, .{ .path = db_path });
+        defer eng.close() catch {};
+        try eng.put("a", "1");
+    }
+
+    var wal_file = try tmp.dir.openFile("wal.log", .{ .mode = .read_write });
+    defer wal_file.close();
+    var bytes = try wal_file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(bytes);
+    if (bytes.len > 8) bytes[8] ^= 0xFF;
+    try wal_file.seekTo(0);
+    try wal_file.writeAll(bytes);
+    try wal_file.setEndPos(bytes.len);
+
+    try std.testing.expectError(EngineError.CorruptedWalRecord, Engine.open(allocator, .{ .path = db_path }));
+    try std.testing.expectError(EngineError.CorruptedWalRecord, Engine.open(allocator, .{ .path = db_path }));
+}
+
+test "task 7.2 positive: acknowledged writes recover after reopen without duplicate apply" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try Engine.open(allocator, .{ .path = db_path });
+        defer eng.close() catch {};
+        try eng.put("r-a", "1");
+        try eng.put("r-a", "2");
+    }
+
+    {
+        var reopened = try Engine.open(allocator, .{ .path = db_path });
+        defer reopened.close() catch {};
+        const got = try reopened.get("r-a");
+        defer reopened.freeValue(got);
+        try std.testing.expectEqualStrings("2", got);
+
+        const next_seq = reopened.next_sequence;
+        reopened.close() catch {};
+
+        var reopened2 = try Engine.open(allocator, .{ .path = db_path });
+        defer reopened2.close() catch {};
+        try std.testing.expectEqual(next_seq, reopened2.next_sequence);
+    }
+}
+
+test "task 7.4 positive: snapshot sequence hides keys written after snapshot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try eng.put("snap-base", "v1");
+    const snapshot_seq = eng.next_sequence - 1;
+    try eng.put("snap-future", "v2");
+
+    try std.testing.expectError(EngineError.KeyNotFound, eng.getAtSnapshot("snap-future", snapshot_seq));
+
+    const latest = try eng.get("snap-future");
+    defer eng.freeValue(latest);
+    try std.testing.expectEqualStrings("v2", latest);
+}
+
+test "task 7.4 negative: close during background activity is deterministic and reopenable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path, .memtable_max_bytes = 24, .compaction_trigger_l0_files = 2 });
+
+    var i: usize = 0;
+    while (i < 160) : (i += 1) {
+        var kbuf: [32]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "bg-{d}", .{i});
+        const v = try std.fmt.bufPrint(&vbuf, "vv-{d}", .{i});
+        try eng.put(k, v);
+    }
+
+    try eng.close();
+
+    var reopened = try Engine.open(allocator, .{ .path = db_path });
+    defer reopened.close() catch {};
+    const got = try reopened.get("bg-159");
+    defer reopened.freeValue(got);
+    try std.testing.expectEqualStrings("vv-159", got);
+}
+
+test "task 12.1 positive: checkpoint creates reopenable snapshot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    const cp_path = try std.fmt.allocPrint(allocator, "{s}/checkpoint", .{db_path});
+    defer allocator.free(cp_path);
+
+    {
+        var eng = try Engine.open(allocator, .{ .path = db_path, .memtable_max_bytes = 24, .compaction_trigger_l0_files = 100 });
+        defer eng.close() catch {};
+
+        var i: usize = 0;
+        while (i < 20) : (i += 1) {
+            var kbuf: [32]u8 = undefined;
+            var vbuf: [32]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "cp-{d}", .{i});
+            const v = try std.fmt.bufPrint(&vbuf, "vv-{d}", .{i});
+            try eng.put(k, v);
+        }
+
+        var attempts: usize = 0;
+        while (attempts < 200) : (attempts += 1) {
+            if ((try eng.property("engine.l0.files")).u64 > 0) break;
+            std.Thread.sleep(2 * std.time.ns_per_ms);
+        }
+
+        try eng.checkpoint(cp_path);
+    }
+
+    var cp = try Engine.open(allocator, .{ .path = cp_path });
+    defer cp.close() catch {};
+    const got = try cp.get("cp-19");
+    defer cp.freeValue(got);
+    try std.testing.expectEqualStrings("vv-19", got);
+}
+
+test "task 12.1 negative: checkpoint rejects empty path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try std.testing.expectError(EngineError.InvalidConfig, eng.checkpoint(""));
+}
+
+test "task 12.1 safety: checkpoint rejects parent traversal path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try std.testing.expectError(EngineError.UnsafeCheckpointPath, eng.checkpoint("../bad"));
+}
+
+test "task 12.1 safety: checkpoint fails on existing directory without overwrite" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    const cp_path = try std.fmt.allocPrint(allocator, "{s}/checkpoint", .{db_path});
+    defer allocator.free(cp_path);
+    try std.fs.cwd().makePath(cp_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try std.testing.expectError(EngineError.CheckpointAlreadyExists, eng.checkpoint(cp_path));
+}
+
+test "task 12.1 safety: incomplete portable checkpoint fails closed on open" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    const cp_path = try std.fmt.allocPrint(allocator, "{s}/checkpoint-incomplete", .{root_path});
+    defer allocator.free(cp_path);
+    try std.fs.cwd().makePath(cp_path);
+
+    const marker_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cp_path, checkpoint_incomplete_marker });
+    defer allocator.free(marker_path);
+
+    {
+        var file = try std.fs.cwd().createFile(marker_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("copying\n");
+    }
+
+    try std.testing.expectError(EngineError.IncompleteCheckpoint, Engine.open(allocator, .{ .path = cp_path }));
+}
+
+test "task 12.1 regression: concurrent checkpoint creators are deterministic and leave no partial output" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    const db_a_path = try std.fmt.allocPrint(allocator, "{s}/db-a", .{root_path});
+    defer allocator.free(db_a_path);
+    const db_b_path = try std.fmt.allocPrint(allocator, "{s}/db-b", .{root_path});
+    defer allocator.free(db_b_path);
+    const cp_path = try std.fmt.allocPrint(allocator, "{s}/checkpoint-race", .{root_path});
+    defer allocator.free(cp_path);
+
+    try std.fs.cwd().makePath(db_a_path);
+    try std.fs.cwd().makePath(db_b_path);
+
+    var eng_a = try Engine.open(allocator, .{ .path = db_a_path, .memtable_max_bytes = 24, .compaction_trigger_l0_files = 100 });
+    defer eng_a.close() catch {};
+    var eng_b = try Engine.open(allocator, .{ .path = db_b_path, .memtable_max_bytes = 24, .compaction_trigger_l0_files = 100 });
+    defer eng_b.close() catch {};
+
+    try eng_a.put("origin", "A");
+    try eng_b.put("origin", "B");
+
+    const Outcome = enum {
+        success,
+        exists,
+        unexpected,
+    };
+
+    const Ctx = struct {
+        eng_a: *Engine,
+        eng_b: *Engine,
+        cp_path: []const u8,
+        outcomes: *[2]Outcome,
+
+        fn run(ctx: *@This(), idx: usize) void {
+            const eng = if (idx == 0) ctx.eng_a else ctx.eng_b;
+            eng.checkpoint(ctx.cp_path) catch |err| {
+                ctx.outcomes[idx] = switch (err) {
+                    EngineError.CheckpointAlreadyExists => .exists,
+                    else => .unexpected,
+                };
+                return;
+            };
+            ctx.outcomes[idx] = .success;
+        }
+    };
+
+    var outcomes = [_]Outcome{ .unexpected, .unexpected };
+    var ctx = Ctx{ .eng_a = &eng_a, .eng_b = &eng_b, .cp_path = cp_path, .outcomes = &outcomes };
+
+    const t1 = try std.Thread.spawn(.{}, Ctx.run, .{ &ctx, @as(usize, 0) });
+    const t2 = try std.Thread.spawn(.{}, Ctx.run, .{ &ctx, @as(usize, 1) });
+    t1.join();
+    t2.join();
+
+    const success_count: usize = @intFromBool(outcomes[0] == .success) + @intFromBool(outcomes[1] == .success);
+    const exists_count: usize = @intFromBool(outcomes[0] == .exists) + @intFromBool(outcomes[1] == .exists);
+    try std.testing.expectEqual(@as(usize, 1), success_count);
+    try std.testing.expectEqual(@as(usize, 1), exists_count);
+
+    var cp = try Engine.open(allocator, .{ .path = cp_path });
+    defer cp.close() catch {};
+    const got = try cp.get("origin");
+    defer cp.freeValue(got);
+    try std.testing.expect(std.mem.eql(u8, got, "A") or std.mem.eql(u8, got, "B"));
+
+    var parent = try openDirNoSymlinkChain(allocator, root_path);
+    defer parent.close();
+    var it = parent.iterate();
+    while (try it.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".ziggy-checkpoint-"));
     }
 }
 
@@ -2199,6 +3268,344 @@ test "task 10.3 negative: unsupported major SST format fails fast on open" {
     try std.testing.expectError(EngineError.UnsupportedFormat, Engine.open(allocator, .{ .path = db_path }));
 }
 
+test "task 12.3 positive: scan range returns sorted keys within [start,end)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try eng.put("a", "1");
+    try eng.put("b", "2");
+    try eng.put("c", "3");
+    try eng.put("d", "4");
+
+    const rows = try eng.scan(.{ .start = "b", .end = "d" });
+    defer eng.freeScan(rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("b", rows[0].key);
+    try std.testing.expectEqualStrings("2", rows[0].value);
+    try std.testing.expectEqualStrings("c", rows[1].key);
+    try std.testing.expectEqualStrings("3", rows[1].value);
+}
+
+test "task 12.3 positive: start-only scan includes lower bound and is ordered" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path, .memtable_max_bytes = 16, .compaction_trigger_l0_files = 100 });
+    defer eng.close() catch {};
+
+    try eng.put("a", "1");
+    try eng.put("b", "2");
+    try eng.put("c", "3");
+    try eng.put("d", "4");
+
+    const rows = try eng.scan(.{ .start = "c" });
+    defer eng.freeScan(rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("c", rows[0].key);
+    try std.testing.expectEqualStrings("d", rows[1].key);
+}
+
+test "task 12.3 negative: invalid scan bounds are rejected" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try std.testing.expectError(EngineError.InvalidConfig, eng.scan(.{ .start = "z", .end = "a" }));
+}
+
+test "task 7.4 positive: scan keeps stable snapshot under concurrent overlapping writes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path, .memtable_max_bytes = 16 * 1024, .compaction_trigger_l0_files = 100 });
+    defer eng.close() catch {};
+
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "snap-{d:0>4}", .{i});
+        try eng.put(key, "base");
+    }
+
+    eng.scan_test_delay_ns = 40 * std.time.ns_per_ms;
+
+    const Ctx = struct {
+        eng: *Engine,
+        rows: ?[]ScanItem = null,
+
+        fn runScan(ctx: *@This()) void {
+            ctx.rows = ctx.eng.scan(.{ .start = "snap-", .end = "snap.~" }) catch null;
+        }
+
+        fn runWriter(ctx: *@This()) void {
+            var waits: usize = 0;
+            while (waits < 500) : (waits += 1) {
+                const count_value = ctx.eng.property("engine.metrics.scan.count") catch {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                };
+                if (count_value.u64 > 0) break;
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+
+            var j: usize = 0;
+            while (j < 1000) : (j += 1) {
+                var key_buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&key_buf, "snap-{d:0>4}", .{j}) catch continue;
+                if (j % 2 == 0) {
+                    ctx.eng.put(key, "new") catch {};
+                } else {
+                    ctx.eng.delete(key) catch {};
+                }
+            }
+        }
+    };
+
+    var ctx = Ctx{ .eng = &eng };
+    const scan_thread = try std.Thread.spawn(.{}, Ctx.runScan, .{&ctx});
+    const writer_thread = try std.Thread.spawn(.{}, Ctx.runWriter, .{&ctx});
+    scan_thread.join();
+    writer_thread.join();
+
+    const rows = ctx.rows orelse return error.TestUnexpectedResult;
+    defer eng.freeScan(rows);
+
+    try std.testing.expectEqual(@as(usize, 2000), rows.len);
+    for (rows) |row| {
+        try std.testing.expectEqualStrings("base", row.value);
+    }
+}
+
+test "task 8.2 positive: scanPrefix keeps stable snapshot under concurrent overlapping writes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path, .memtable_max_bytes = 16 * 1024, .compaction_trigger_l0_files = 100 });
+    defer eng.close() catch {};
+
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "pref-{d:0>4}", .{i});
+        try eng.put(key, "base");
+    }
+
+    eng.scan_test_delay_ns = 40 * std.time.ns_per_ms;
+
+    const Ctx = struct {
+        eng: *Engine,
+        rows: ?[]ScanItem = null,
+
+        fn runScan(ctx: *@This()) void {
+            ctx.rows = ctx.eng.scanPrefix("pref-") catch null;
+        }
+
+        fn runWriter(ctx: *@This()) void {
+            var waits: usize = 0;
+            while (waits < 500) : (waits += 1) {
+                const count_value = ctx.eng.property("engine.metrics.scan.count") catch {
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    continue;
+                };
+                if (count_value.u64 > 0) break;
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
+
+            var j: usize = 0;
+            while (j < 1000) : (j += 1) {
+                var key_buf: [32]u8 = undefined;
+                const key = std.fmt.bufPrint(&key_buf, "pref-{d:0>4}", .{j}) catch continue;
+                if (j % 2 == 0) {
+                    ctx.eng.put(key, "new") catch {};
+                } else {
+                    ctx.eng.delete(key) catch {};
+                }
+            }
+        }
+    };
+
+    var ctx = Ctx{ .eng = &eng };
+    const scan_thread = try std.Thread.spawn(.{}, Ctx.runScan, .{&ctx});
+    const writer_thread = try std.Thread.spawn(.{}, Ctx.runWriter, .{&ctx});
+    scan_thread.join();
+    writer_thread.join();
+
+    const rows = ctx.rows orelse return error.TestUnexpectedResult;
+    defer eng.freeScan(rows);
+
+    try std.testing.expectEqual(@as(usize, 2000), rows.len);
+    for (rows) |row| {
+        try std.testing.expectEqualStrings("base", row.value);
+    }
+}
+
+test "task 12.3 stress: large SST range scan stays within bounded allocator budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng_seed = try Engine.open(allocator, .{
+            .path = db_path,
+            .memtable_max_bytes = 64 * 1024,
+            .compaction_trigger_l0_files = 1000,
+            .slowdown_l0_files = 10_000,
+            .stop_l0_files = 20_000,
+            .slowdown_immutable_count = 10_000,
+            .stop_immutable_count = 20_000,
+        });
+        defer eng_seed.close() catch {};
+
+        var i: usize = 0;
+        while (i < 20000) : (i += 1) {
+            var key_buf: [32]u8 = undefined;
+            var value_buf: [512]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "bulk-{d:0>5}", .{i});
+            const tail = try std.fmt.bufPrint(&value_buf, "{d:0>5}-", .{i});
+            @memset(value_buf[tail.len..], 'x');
+            try eng_seed.put(key, value_buf[0..]);
+        }
+    }
+
+    const budget_backing = try allocator.alloc(u8, 4 * 1024 * 1024);
+    defer allocator.free(budget_backing);
+    var fba = std.heap.FixedBufferAllocator.init(budget_backing);
+
+    tmp.dir.deleteFile("wal.log") catch {};
+
+    var eng = try Engine.open(fba.allocator(), .{ .path = db_path });
+    defer eng.close() catch {};
+
+    const rows = try eng.scan(.{ .start = "bulk-12345", .end = "bulk-12346" });
+    defer eng.freeScan(rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("bulk-12345", rows[0].key);
+}
+
+test "task 12.3 stress: large SST point get stays within bounded allocator budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng_seed = try Engine.open(allocator, .{
+            .path = db_path,
+            .memtable_max_bytes = 64 * 1024,
+            .compaction_trigger_l0_files = 1000,
+            .slowdown_l0_files = 10_000,
+            .stop_l0_files = 20_000,
+            .slowdown_immutable_count = 10_000,
+            .stop_immutable_count = 20_000,
+        });
+        defer eng_seed.close() catch {};
+
+        var i: usize = 0;
+        while (i < 20000) : (i += 1) {
+            var key_buf: [32]u8 = undefined;
+            var value_buf: [512]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "bulk-{d:0>5}", .{i});
+            const tail = try std.fmt.bufPrint(&value_buf, "{d:0>5}-", .{i});
+            @memset(value_buf[tail.len..], 'y');
+            try eng_seed.put(key, value_buf[0..]);
+        }
+    }
+
+    const budget_backing = try allocator.alloc(u8, 4 * 1024 * 1024);
+    defer allocator.free(budget_backing);
+    var fba = std.heap.FixedBufferAllocator.init(budget_backing);
+
+    tmp.dir.deleteFile("wal.log") catch {};
+
+    var eng = try Engine.open(fba.allocator(), .{ .path = db_path });
+    defer eng.close() catch {};
+
+    const got = try eng.get("bulk-12345");
+    defer eng.freeValue(got);
+
+    try std.testing.expect(got.len > 0);
+}
+
+test "task 12.3 stress: large SST scanPrefix stays within bounded allocator budget" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng_seed = try Engine.open(allocator, .{
+            .path = db_path,
+            .memtable_max_bytes = 64 * 1024,
+            .compaction_trigger_l0_files = 1000,
+            .slowdown_l0_files = 10_000,
+            .stop_l0_files = 20_000,
+            .slowdown_immutable_count = 10_000,
+            .stop_immutable_count = 20_000,
+        });
+        defer eng_seed.close() catch {};
+
+        var i: usize = 0;
+        while (i < 20000) : (i += 1) {
+            var key_buf: [32]u8 = undefined;
+            var value_buf: [512]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "bulk-{d:0>5}", .{i});
+            const tail = try std.fmt.bufPrint(&value_buf, "{d:0>5}-", .{i});
+            @memset(value_buf[tail.len..], 'z');
+            try eng_seed.put(key, value_buf[0..]);
+        }
+    }
+
+    const budget_backing = try allocator.alloc(u8, 4 * 1024 * 1024);
+    defer allocator.free(budget_backing);
+    var fba = std.heap.FixedBufferAllocator.init(budget_backing);
+
+    tmp.dir.deleteFile("wal.log") catch {};
+
+    var eng = try Engine.open(fba.allocator(), .{ .path = db_path });
+    defer eng.close() catch {};
+
+    const rows = try eng.scanPrefix("bulk-12345");
+    defer eng.freeScan(rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("bulk-12345", rows[0].key);
+}
+
 test "task 10.2 negative: unknown property returns typed error" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2211,4 +3618,174 @@ test "task 10.2 negative: unknown property returns typed error" {
     defer eng.close() catch {};
 
     try std.testing.expectError(EngineError.UnknownProperty, eng.property("engine.unknown.key"));
+}
+
+test "task p1 positive: writeBatch applies multiple ops and survives reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try Engine.open(allocator, .{ .path = db_path });
+        defer eng.close() catch {};
+
+        const ops = [_]BatchOp{
+            .{ .op = .put, .key = "u:1", .value = "alice" },
+            .{ .op = .put, .key = "u:2", .value = "bob" },
+            .{ .op = .delete, .key = "u:3", .value = "" },
+        };
+        try eng.writeBatch(&ops);
+    }
+
+    {
+        var reopened = try Engine.open(allocator, .{ .path = db_path });
+        defer reopened.close() catch {};
+
+        const v1 = try reopened.get("u:1");
+        defer reopened.freeValue(v1);
+        try std.testing.expectEqualStrings("alice", v1);
+
+        const v2 = try reopened.get("u:2");
+        defer reopened.freeValue(v2);
+        try std.testing.expectEqualStrings("bob", v2);
+
+        try std.testing.expectError(EngineError.KeyNotFound, reopened.get("u:3"));
+    }
+}
+
+test "task p1 negative: crash after batch WAL append before mem apply replays exactly once" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try Engine.open(allocator, .{ .path = db_path, .compaction_trigger_l0_files = 100 });
+        defer eng.close() catch {};
+
+        const seq = eng.next_sequence;
+        const ops = [_]BatchOp{
+            .{ .op = .put, .key = "mid:1", .value = "v1" },
+            .{ .op = .put, .key = "mid:2", .value = "v2" },
+        };
+
+        const rec = try encodeBatchRecord(allocator, seq, &ops);
+        defer allocator.free(rec);
+
+        // Simulate kill window: WAL durable, memtable not applied.
+        try appendFramed(&eng, rec);
+    }
+
+    {
+        var reopened = try Engine.open(allocator, .{ .path = db_path });
+        defer reopened.close() catch {};
+
+        const a = try reopened.get("mid:1");
+        defer reopened.freeValue(a);
+        try std.testing.expectEqualStrings("v1", a);
+
+        const b = try reopened.get("mid:2");
+        defer reopened.freeValue(b);
+        try std.testing.expectEqualStrings("v2", b);
+
+        const seq_after = reopened.next_sequence;
+        reopened.close() catch {};
+
+        var reopened2 = try Engine.open(allocator, .{ .path = db_path });
+        defer reopened2.close() catch {};
+        try std.testing.expectEqual(seq_after, reopened2.next_sequence);
+    }
+}
+
+test "task p1 negative: corrupted batch WAL fails open deterministically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    {
+        var eng = try Engine.open(allocator, .{ .path = db_path });
+        defer eng.close() catch {};
+
+        const ops = [_]BatchOp{
+            .{ .op = .put, .key = "c:1", .value = "x" },
+            .{ .op = .put, .key = "c:2", .value = "y" },
+        };
+        try eng.writeBatch(&ops);
+    }
+
+    var wal_file = try tmp.dir.openFile("wal.log", .{ .mode = .read_write });
+    defer wal_file.close();
+
+    var bytes = try wal_file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(bytes);
+
+    if (bytes.len > 8) bytes[8] ^= 0xFF;
+    try wal_file.seekTo(0);
+    try wal_file.writeAll(bytes);
+    try wal_file.setEndPos(bytes.len);
+
+    try std.testing.expectError(EngineError.CorruptedWalRecord, Engine.open(allocator, .{ .path = db_path }));
+    try std.testing.expectError(EngineError.CorruptedWalRecord, Engine.open(allocator, .{ .path = db_path }));
+}
+
+test "task p1 positive: snapshot read remains stable while newer batch commits" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    const snap = try eng.beginSnapshot();
+
+    const ops = [_]BatchOp{
+        .{ .op = .put, .key = "snap:key", .value = "v2" },
+        .{ .op = .put, .key = "other:key", .value = "x" },
+    };
+    try eng.writeBatch(&ops);
+
+    try std.testing.expectError(EngineError.KeyNotFound, eng.getSnapshot(snap, "snap:key"));
+
+    const latest = try eng.get("snap:key");
+    defer eng.freeValue(latest);
+    try std.testing.expectEqualStrings("v2", latest);
+
+    eng.releaseSnapshot(snap);
+}
+
+test "task p1 regression: classifyError maps key engine errors" {
+    try std.testing.expectEqual(ErrorClass.busy, classifyError(EngineError.WriteStall));
+    try std.testing.expectEqual(ErrorClass.busy, classifyError(EngineError.LockHeld));
+    try std.testing.expectEqual(ErrorClass.corruption, classifyError(EngineError.CorruptedWalRecord));
+    try std.testing.expectEqual(ErrorClass.not_found, classifyError(EngineError.KeyNotFound));
+    try std.testing.expectEqual(ErrorClass.retryable, classifyError(EngineError.EngineClosed));
+}
+
+test "task 10.2 positive: platform capability properties are exposed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var eng = try Engine.open(allocator, .{ .path = db_path });
+    defer eng.close() catch {};
+
+    try std.testing.expect((try eng.property("engine.platform.os")).text.len > 0);
+    try std.testing.expect((try eng.property("engine.platform.arch")).text.len > 0);
+    try std.testing.expect((try eng.property("engine.platform.tier")).text.len > 0);
+    try std.testing.expect((try eng.property("engine.platform.pointer_bits")).u64 >= 32);
+    try std.testing.expect((try eng.property("engine.platform.supported")).u64 <= 1);
 }

@@ -1,4 +1,4 @@
-//! ziggy root module exports.
+//! Public package entrypoint that re-exports the storage engine modules.
 const std = @import("std");
 
 pub const wal = @import("ziggy/wal.zig");
@@ -12,8 +12,11 @@ pub const access = @import("ziggy/access.zig");
 pub const clock_cache = @import("ziggy/clock_cache.zig");
 pub const compaction = @import("ziggy/compaction.zig");
 pub const recovery = @import("ziggy/recovery.zig");
+pub const platform = @import("ziggy/platform.zig");
+pub const comptime_bytes = @import("ziggy/comptime_bytes.zig");
 pub const engine = @import("ziggy/engine.zig");
 
+// Small sample helper that prints a test hint using buffered stdout.
 pub fn bufferedPrint() !void {
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
@@ -23,10 +26,12 @@ pub fn bufferedPrint() !void {
     try stdout.flush();
 }
 
+// Tiny example function kept by the starter template tests.
 pub fn add(a: i32, b: i32) i32 {
     return a + b;
 }
 
+// Returns a fixed tag used by one regression-style test.
 pub fn loopGoalTag() []const u8 {
     return "test loop";
 }
@@ -51,5 +56,7 @@ test {
     _ = clock_cache;
     _ = compaction;
     _ = recovery;
+    _ = platform;
+    _ = comptime_bytes;
     _ = engine;
 }
