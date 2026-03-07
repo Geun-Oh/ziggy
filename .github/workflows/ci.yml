@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            label: linux-x86_64
+          - runner: macos-14
+            label: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build and run tests
+        run: |
+          zig build
+          zig test src/ziggy/engine.zig
+          zig build test
+
+      - name: Cross-target build gate
+        run: zig build platform-matrix

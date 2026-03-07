@@ -37,6 +37,47 @@ The current runtime is intentionally small and single-process-writer oriented, b
 - Package name: `ziggy`
 - Module root: `src/root.zig`
 
+## Supported platforms
+
+ziggy now exposes a platform capability model at runtime and uses tiered support language for operational clarity.
+
+### Tier 1
+
+Fully supported and covered by CI/release automation:
+
+- Linux `x86_64`
+- Linux `aarch64`
+- macOS `x86_64`
+- macOS `aarch64`
+
+### Tier 2
+
+Expected to work, but with reduced automated verification:
+
+- FreeBSD `x86_64`
+- FreeBSD `aarch64`
+
+### Experimental
+
+- Other POSIX-like targets that compile but are not yet covered by release automation or operational validation
+
+### Unsupported
+
+The engine fails fast on unsupported host/platform combinations during `Engine.open()`.
+
+### Platform capability properties
+
+The engine property API exposes runtime capability flags such as:
+
+- `engine.platform.os`
+- `engine.platform.arch`
+- `engine.platform.tier`
+- `engine.platform.pointer_bits`
+- `engine.platform.supported`
+- `engine.platform.checkpoint_atomic_noreplace`
+- `engine.platform.checkpoint_portable_reservation`
+- `engine.platform.direct_io_path`
+
 ## Quickstart
 
 ### Build
@@ -193,7 +234,62 @@ Use `ziggy.recovery` to encode mutations, archive WAL segments, and restore stat
 ```bash
 zig build test
 zig build run
+zig build platform-matrix
 ```
+
+## Release artifacts
+
+Version tags trigger a GitHub Actions release workflow that builds and publishes per-target archives for the Tier 1 matrix.
+
+Generated artifacts:
+
+- `ziggy-x86_64-linux.tar.gz`
+- `ziggy-aarch64-linux.tar.gz`
+- `ziggy-x86_64-macos.tar.gz`
+- `ziggy-aarch64-macos.tar.gz`
+- matching `.sha256` checksum files for each archive
+
+Each archive contains:
+
+- `ziggy` binary
+- `README.md`
+- `LICENSE`
+
+## How to cut a release
+
+1. Ensure `main` is green in CI.
+2. Update `CHANGELOG.md` with the release highlights.
+3. Create and push a semantic version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+3. GitHub Actions will automatically:
+   - run the release build matrix
+   - package binaries for each supported Tier 1 OS/architecture target
+   - generate SHA-256 checksum files
+   - publish/update the corresponding GitHub Release
+
+Release note categories are configured in `.github/release.yml`, the human-readable project history is tracked in `CHANGELOG.md`, and the full release operator checklist lives in [`RELEASING.md`](./RELEASING.md).
+
+## CI automation
+
+The repository uses GitHub Actions for three layers of automation:
+
+1. **CI (`ci.yml`)**
+   - runs on pushes to `main`, pull requests, and release tags
+   - executes build/test validation on representative native runners
+   - runs the cross-target build gate via `zig build platform-matrix`
+
+2. **Nightly soak (`nightly-soak.yml`)**
+   - runs scheduled long-duration compatibility, fault-matrix, ENOSPC, and soak verification
+
+3. **Release (`release.yml`)**
+   - runs on `v*` tag pushes
+   - builds per-target release archives
+   - publishes artifacts to GitHub Releases automatically
 
 ## Contributing
 

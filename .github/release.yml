@@ -1,0 +1,40 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+      - chore
+      - internal
+    authors:
+      - github-actions[bot]
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking-change
+    - title: Storage Engine
+      labels:
+        - engine
+        - wal
+        - manifest
+        - compaction
+        - recovery
+    - title: Platform and Portability
+      labels:
+        - platform
+        - portability
+        - os-arch
+    - title: Performance and Optimization
+      labels:
+        - performance
+        - comptime
+        - optimization
+    - title: CI / Release Automation
+      labels:
+        - ci
+        - release
+        - automation
+    - title: Documentation
+      labels:
+        - docs
+    - title: Other Changes
+      labels:
+        - '*'

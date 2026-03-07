@@ -29,6 +29,9 @@ jobs:
           zig test src/ziggy/engine.zig
           zig build test
 
+      - name: Target matrix build gate
+        run: zig build platform-matrix
+
       - name: Compatibility policy gate (major/minor)
         run: |
           zig test src/ziggy/engine.zig --test-filter "task 10.3 positive: supported minor SST format opens successfully"

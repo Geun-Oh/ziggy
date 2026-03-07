@@ -1,3 +1,4 @@
+//! Build graph for the ziggy library, CLI binary, and test suite.
 const std = @import("std");
 
 // Although this function looks imperative, it does not perform the build
@@ -139,6 +140,29 @@ pub fn build(b: *std.Build) void {
 
     const cli_e2e = b.addSystemCommand(&.{ "bash", b.pathFromRoot("scripts/cli_e2e.sh"), b.pathFromRoot("zig-out/bin/ziggy") });
     cli_e2e.step.dependOn(b.getInstallStep());
+
+    const platform_matrix_step = b.step("platform-matrix", "Build key OS/arch target matrix");
+    const matrix_targets = [_]std.Target.Query{
+        .{ .cpu_arch = .x86_64, .os_tag = .linux },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux },
+        .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+    };
+    inline for (matrix_targets) |query| {
+        const resolved = b.resolveTargetQuery(query);
+        const target_exe = b.addExecutable(.{
+            .name = b.fmt("ziggy-{s}-{s}", .{ @tagName(query.os_tag.?), @tagName(query.cpu_arch.?) }),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = resolved,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "ziggy", .module = mod },
+                },
+            }),
+        });
+        platform_matrix_step.dependOn(&target_exe.step);
+    }
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the run steps do not depend on one another, this will

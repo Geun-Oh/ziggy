@@ -1,0 +1,89 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux
+            artifact: ziggy-x86_64-linux
+            smoke: true
+          - runner: ubuntu-latest
+            target: aarch64-linux
+            artifact: ziggy-aarch64-linux
+            smoke: false
+          - runner: macos-14
+            target: x86_64-macos
+            artifact: ziggy-x86_64-macos
+            smoke: false
+          - runner: macos-14
+            target: aarch64-macos
+            artifact: ziggy-aarch64-macos
+            smoke: true
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build release binary
+        run: |
+          zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+          mkdir -p dist/${{ matrix.artifact }}
+          cp zig-out/bin/ziggy dist/${{ matrix.artifact }}/ziggy
+          cp README.md LICENSE dist/${{ matrix.artifact }}/
+          tar -C dist -czf dist/${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          shasum -a 256 dist/${{ matrix.artifact }}.tar.gz > dist/${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Native smoke test
+        if: matrix.smoke
+        run: |
+          DB_DIR="$(mktemp -d)"
+          ./dist/${{ matrix.artifact }}/ziggy open --path "$DB_DIR"
+          ./dist/${{ matrix.artifact }}/ziggy put --path "$DB_DIR" --key smoke --value ok
+          ./dist/${{ matrix.artifact }}/ziggy get --path "$DB_DIR" --key smoke
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}.tar.gz
+            dist/${{ matrix.artifact }}.tar.gz.sha256
+
+  publish-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            release-artifacts/**/*.tar.gz
+            release-artifacts/**/*.sha256
+          generate_release_notes: true
