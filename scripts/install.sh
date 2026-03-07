@@ -7,6 +7,45 @@ INSTALL_DIR="${INSTALL_DIR:-}"
 VERSION="${VERSION:-latest}"
 TMP_DIR="${TMPDIR:-/tmp}/ziggy-install-$$"
 
+print_help() {
+  cat <<'EOF'
+ziggy installer
+
+Usage:
+  sh install.sh [--version <tag|latest>] [--install-dir <dir>]
+  VERSION=v0.1.1 INSTALL_DIR=/usr/local/bin sh install.sh
+
+Options:
+  --version <tag|latest>   Release tag to install. Default: latest
+  --install-dir <dir>      Destination directory for the ziggy binary
+  -h, --help               Show this help text
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --version)
+      [ "$#" -ge 2 ] || { echo "error: --version requires a value" >&2; exit 1; }
+      VERSION="$2"
+      shift 2
+      ;;
+    --install-dir)
+      [ "$#" -ge 2 ] || { echo "error: --install-dir requires a value" >&2; exit 1; }
+      INSTALL_DIR="$2"
+      shift 2
+      ;;
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      print_help >&2
+      exit 1
+      ;;
+  esac
+done
+
 cleanup() {
   rm -rf "$TMP_DIR"
 }

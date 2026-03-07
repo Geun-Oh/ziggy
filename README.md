@@ -1,5 +1,9 @@
 # ziggy
 
+[![CI](https://github.com/Geun-Oh/ziggy/actions/workflows/ci.yml/badge.svg)](https://github.com/Geun-Oh/ziggy/actions/workflows/ci.yml)
+[![Release](https://github.com/Geun-Oh/ziggy/actions/workflows/release.yml/badge.svg)](https://github.com/Geun-Oh/ziggy/actions/workflows/release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/Geun-Oh/ziggy)](https://github.com/Geun-Oh/ziggy/releases/latest)
+
 `ziggy` is an **LSM-tree-based embedded key-value storage engine** implemented in Zig.
 The repository now includes a usable integrated `Engine` API and operator-facing CLI on top of the core storage building blocks.
 
@@ -16,7 +20,13 @@ curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | VERSION=v0.1.1 sh
+curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | sh -s -- --version v0.1.1
+```
+
+Show installer help:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | sh -s -- --help
 ```
 
 Default install location:
@@ -29,7 +39,7 @@ Default install location:
 Override the install directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | INSTALL_DIR=/usr/local/bin sh
+curl -fsSL https://raw.githubusercontent.com/Geun-Oh/ziggy/main/scripts/install.sh | sh -s -- --install-dir /usr/local/bin
 ```
 
 ### Manual download
