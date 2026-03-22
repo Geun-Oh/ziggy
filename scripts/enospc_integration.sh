@@ -83,7 +83,7 @@ if [[ -f "$ERR_LOG" ]]; then
 fi
 
 error_mentions_diskfull=false
-if echo "$last_error" | grep -Eiq 'ENOSPC|No space left|DiskFull|FileTooBig|Quota'; then
+if echo "$last_error" | grep -Eiq 'ENOSPC|No ?space ?left|DiskFull|NoSpaceLeft|FileTooBig|Quota'; then
   error_mentions_diskfull=true
 fi
 
