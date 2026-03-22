@@ -20,3 +20,7 @@ _write_ahead_log.md
 SPEC.md
 TASK.md
 TRACEABILITY.md
+
+# AI Service Contexts
+.omc/
+.claude/
